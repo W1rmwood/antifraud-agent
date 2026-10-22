@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# antifraud-agent: модели, базы и прогоны не коммитим (ТЗ, «Правила работы»)
+data/runs/*
+!data/runs/demo.jsonl
+data/*.db
+data/chroma/
+models/

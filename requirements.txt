@@ -1,0 +1,30 @@
+# Python 3.11. Версии зафиксированы и проверены вместе (pip check) на macOS arm64, 2026-10-23.
+
+# контракты
+pydantic==2.14.1
+
+# звук → реплики (audio/)
+faster-whisper==1.2.1
+silero-vad==6.2.3
+torch==2.14.1
+onnxruntime==1.31.0
+soundfile==0.14.0
+numpy==2.4.6
+scipy==1.17.1
+
+# RAG, агент, MCP (rag/, agent/, mcp_server/)
+ollama==0.6.3
+chromadb==1.5.9
+rank-bm25==0.2.2
+pymorphy3==2.0.6
+pymorphy3-dicts-ru==2.4.417150.4580142
+FlashRank==0.2.10
+langgraph==1.2.16
+mcp==2.3.0
+
+# интерфейс
+streamlit==1.66.1
+
+# тесты и оценка
+pytest==9.1.1
+jiwer==4.0.0

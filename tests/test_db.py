@@ -31,9 +31,7 @@ def make_case(call_id: str, phone: str | None, days_ago: int = 0, scheme_id: str
     ("7-999-123-45-67", "+79991234567"),
     ("9991234567", "+79991234567"),
     ("  8 999 123.45.67 ", "+79991234567"),
-    ("+380 44 123 45 67", "+380441234567"),
-    ("+1 (202) 555-0123", "+12025550123"),
-    ("+375291234567", "+375291234567"),
+    ("8 (999) 123-45-67", "+79991234567"),
 ])
 def test_normalize_phone(raw, expected):
     assert db.normalize_phone(raw) == expected
@@ -43,6 +41,26 @@ def test_normalize_phone(raw, expected):
 def test_normalize_phone_garbage(garbage):
     with pytest.raises(ValueError):
         db.normalize_phone(garbage)
+
+
+@pytest.mark.parametrize("foreign_or_bad_length", [
+    "+380 44 123 45 67",   # Украина
+    "+1 (202) 555-0123",   # США
+    "+375291234567",       # Беларусь
+    "+44 20 7946 0958",    # Великобритания
+    "+7 999 123 45 6",     # +7, но 9 цифр
+    "+7 999 123 45 678",   # +7, но 11 цифр
+    "8 999 123 45",        # короткий
+    "123",
+])
+def test_normalize_phone_rejects_non_russian(foreign_or_bad_length):
+    with pytest.raises(ValueError):
+        db.normalize_phone(foreign_or_bad_length)
+
+
+def test_lookup_foreign_number_raises():
+    with pytest.raises(ValueError):
+        db.lookup_number("+44 20 7946 0958")
 
 
 # --- init_db ---
@@ -67,8 +85,8 @@ def test_lookup_unknown_number():
 
 
 def test_lookup_normalizes_input():
-    db.save_case(make_case("c1", "8 (999) 123-45-67"))
-    info = db.lookup_number("+7 999 123 45 67")
+    db.save_case(make_case("c1", "+79991234567"))
+    info = db.lookup_number("8 (999) 123-45-67")
     assert info.phone == "+79991234567"
     assert info.calls_count == 1
 
@@ -80,7 +98,7 @@ def test_lookup_garbage_raises():
 
 def test_lookup_history():
     db.save_case(make_case("c1", "+79991234567", days_ago=10, scheme_id="safe-account"))
-    db.save_case(make_case("c2", "89991234567", days_ago=3, scheme_id="gosuslugi"))
+    db.save_case(make_case("c2", "+79991234567", days_ago=3, scheme_id="gosuslugi"))
     db.save_case(make_case("c3", "+79991234567", days_ago=1, scheme_id="safe-account"))
     db.save_case(make_case("c4", "+79991234567", days_ago=0, scheme_id=None))
     info = db.lookup_number("+79991234567")
@@ -100,9 +118,12 @@ def test_save_case_returns_id_and_roundtrips():
 
 
 def test_save_case_normalizes_phone():
-    db.save_case(make_case("c1", "8 999 123-45-67"))
+    # В CallCase номер уже нормализован (контракт Phone), сырой ввод принимают только строковые функции.
+    db.save_case(make_case("c1", "+79991234567"))
     [stored] = db.list_recent_cases()
     assert stored.phone == "+79991234567"
+    assert [c.call_id for c in db.get_cases_by_number("8 999 123-45-67")] == ["c1"]
+    assert db.lookup_number("8 (999) 123-45-67").calls_count == 1
 
 
 def test_save_case_without_phone():

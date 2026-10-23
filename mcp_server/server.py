@@ -68,12 +68,13 @@ async def _storage_call[T](func: Callable[..., T], *args: object) -> T:
         raise ToolError(str(error)) from error
 
 
-def build_default_server(settings: Settings) -> MCPServer:
+def build_default_server(settings: Settings, retriever: Retriever | None = None) -> MCPServer:
+    """Server on the real SQLite storage. Pass `retriever` to share an already loaded index."""
     from storage import db  # noqa: PLC0415  real SQLite only when running for real
 
     db.init_db(settings.db_path)
     return build_server(
-        Retriever.from_settings(settings), db, load_schemes(settings.schemes_dir)
+        retriever or Retriever.from_settings(settings), db, load_schemes(settings.schemes_dir)
     )
 
 

@@ -1,0 +1,32 @@
+"""Where agent events go: the UI queue and the call's log file data/runs/<call_id>.jsonl."""
+
+import asyncio
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from contracts import AgentEvent, EventType
+
+
+class EventSink:
+    def __init__(
+        self, call_id: str, queue: asyncio.Queue[AgentEvent] | None = None, log_path: Path | None = None
+    ) -> None:
+        self.call_id = call_id
+        self._queue = queue
+        self._log_path = log_path
+        self.events: list[AgentEvent] = []
+        if log_path is not None:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text("", encoding="utf-8")  # a rerun of the same call_id starts a fresh log
+
+    async def emit(self, type_: EventType, payload: dict[str, Any]) -> AgentEvent:
+        event = AgentEvent(call_id=self.call_id, ts=datetime.now(UTC), type=type_, payload=payload)
+        self.events.append(event)
+        if self._log_path is not None:
+            # One short line per event: cheap enough to write without leaving the event loop.
+            with self._log_path.open("a", encoding="utf-8") as log:
+                log.write(event.model_dump_json() + "\n")
+        if self._queue is not None:
+            await self._queue.put(event)
+        return event

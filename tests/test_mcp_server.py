@@ -1,9 +1,12 @@
 """MCP tools through a real MCP client, with the server running in-process on fakes."""
 
+import os
+import sys
 from datetime import datetime
+from pathlib import Path
 
 import pytest
-from mcp import Client
+from mcp import Client, StdioServerParameters
 from mcp.server.mcpserver import MCPServer
 
 from contracts import CallCase, NumberInfo, Scheme
@@ -83,3 +86,14 @@ async def test_bad_phone_is_tool_error_not_crash(server: MCPServer) -> None:
         assert "380441234567" in result.content[0].text
         # The server is still alive after the failure.
         assert not (await client.call_tool("list_recent_cases", {})).is_error
+
+
+async def test_real_server_over_stdio(tmp_path: Path) -> None:
+    """`python -m mcp_server.server` as a subprocess, on real SQLite; bm25 needs no Ollama."""
+    env = {**os.environ, "ANTIFRAUD_RETRIEVAL_MODE": "bm25", "ANTIFRAUD_DB": str(tmp_path / "test.db")}
+    params = StdioServerParameters(command=sys.executable, args=["-m", "mcp_server.server"], env=env, cwd=os.getcwd())
+    async with Client(params) as client:
+        result = await client.call_tool("lookup_number", {"phone": PHONE})
+        assert NumberInfo.model_validate(result.structured_content).calls_count == 0
+        hits = await client.call_tool("search_schemes", {"query": "назовите код из смс"})
+        assert len(hits.structured_content["result"]) == 5

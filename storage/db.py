@@ -24,14 +24,15 @@ DEFAULT_DB_PATH = os.environ.get("ANTIFRAUD_DB", str(ROOT / "data" / "antifraud.
 _db_path: str = DEFAULT_DB_PATH
 
 _ALLOWED_PHONE_CHARS = re.compile(r"^[\d\s()\-+.]*$")
+_PHONE = re.compile(r"^\+7\d{10}$")
 
 
 def normalize_phone(phone: str) -> str:
-    """Приводит номер к виду +79991234567.
+    """Приводит номер к виду +79991234567 (контракт Phone принимает только +7 и 10 цифр).
 
     Ведущая 8 (и 7 без плюса) у 11-значного номера → +7, 10-значный номер на 9 → +79…,
-    пробелы, скобки, дефисы и точки убираются, другой код страны сохраняется как +<код>….
-    Строка без цифр или с посторонними символами → ValueError.
+    пробелы, скобки, дефисы и точки убираются.
+    Строка без цифр, с посторонними символами, номер другой страны или не той длины → ValueError.
     """
     if not isinstance(phone, str):
         raise ValueError(f"номер должен быть строкой: {phone!r}")
@@ -42,12 +43,16 @@ def normalize_phone(phone: str) -> str:
     if not digits:
         raise ValueError(f"в номере нет цифр: {phone!r}")
     if raw.startswith("+"):
-        return "+" + digits
-    if len(digits) == 11 and digits[0] in "78":
-        return "+7" + digits[1:]
-    if len(digits) == 10 and digits[0] == "9":
-        return "+7" + digits
-    return "+" + digits
+        result = "+" + digits
+    elif len(digits) == 11 and digits[0] in "78":
+        result = "+7" + digits[1:]
+    elif len(digits) == 10 and digits[0] == "9":
+        result = "+7" + digits
+    else:
+        result = "+" + digits
+    if not _PHONE.match(result):
+        raise ValueError(f"номер не российский или неверной длины (нужно +7 и 10 цифр): {phone!r}")
+    return result
 
 
 @contextmanager

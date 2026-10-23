@@ -13,6 +13,7 @@ here the right moment for each tool is known in advance.
 """
 
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -47,6 +48,17 @@ class AgentDeps:
     settings: Settings
 
 
+@dataclass(frozen=True)
+class Turn:
+    """Trace of one analyzed utterance, kept for eval (latency, threshold tuning)."""
+
+    seq: int
+    caller_text: str
+    candidates: list[str]
+    analysis: Analysis | None
+    latency_s: float
+
+
 @dataclass
 class CallState:
     """What the agent knows about the call so far."""
@@ -66,6 +78,7 @@ class CallAgent:
     def __init__(self, call_id: str, deps: AgentDeps, sink: EventSink, tools: ToolClient) -> None:
         self.call_id = call_id
         self.state = CallState()
+        self.turns: list[Turn] = []
         self._deps = deps
         self._sink = sink
         self._tools = tools
@@ -96,7 +109,17 @@ class CallAgent:
         if utterance.speaker == Speaker.user:
             return  # the agent reacts to the caller; the user's words still stay in the window
         window = self.state.transcript[-self._deps.settings.window_size :]
-        await self._graph.ainvoke({"window": window})
+        started = time.perf_counter()
+        result = await self._graph.ainvoke({"window": window})
+        self.turns.append(
+            Turn(
+                seq=utterance.seq,
+                caller_text=result.get("caller_text", ""),
+                candidates=[h.scheme_id for h in result.get("hits", [])],
+                analysis=result.get("analysis"),
+                latency_s=time.perf_counter() - started,
+            )
+        )
 
     async def finish(self) -> CallCase:
         summary = await self._summarize()
@@ -133,7 +156,9 @@ class CallAgent:
     async def _retrieve(self, state: TurnState) -> TurnState:
         caller_text = " ".join(u.text for u in state["window"] if u.speaker != Speaker.user)
         settings = self._deps.settings
-        hits = await self._deps.retriever.asearch(caller_text, settings.top_k) if caller_text else []
+        if not caller_text:
+            return {"caller_text": "", "hits": []}
+        hits = await self._deps.retriever.asearch(caller_text, settings.top_k, settings.retrieval_mode)
         return {"caller_text": caller_text, "hits": hits}
 
     async def _analyze(self, state: TurnState) -> TurnState:

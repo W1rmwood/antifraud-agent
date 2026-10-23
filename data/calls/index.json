@@ -1,0 +1,14 @@
+[
+  {"file": "001.wav", "phone": "+79990000001", "scheme_id": "safe-account", "channels": "stereo", "transcript": "001.txt"},
+  {"file": "002.wav", "phone": "+79990000002", "scheme_id": "relative-accident", "channels": "stereo", "transcript": "002.txt"},
+  {"file": "003.wav", "phone": "+79990000003", "scheme_id": "gosuslugi", "channels": "stereo", "transcript": "003.txt"},
+  {"file": "004.wav", "phone": "+79990000004", "scheme_id": "bank-security-service", "channels": "stereo", "transcript": "004.txt"},
+  {"file": "005.wav", "phone": "+79990000105", "scheme_id": "marketplace-delivery", "channels": "stereo", "transcript": "005.txt"},
+  {"file": "006.wav", "phone": "+79990000013", "scheme_id": "intercom-replacement", "channels": "mono", "transcript": "006.txt"},
+  {"file": "007.wav", "phone": "+79990000107", "scheme_id": "law-enforcement", "channels": "mono", "transcript": "007.txt"},
+  {"file": "008.wav", "phone": "+79990000108", "scheme_id": "investment-broker", "channels": "stereo", "transcript": "008.txt"},
+  {"file": "009.wav", "phone": "+79990000109", "scheme_id": "sim-card-renewal", "channels": "stereo", "transcript": "009.txt"},
+  {"file": "010.wav", "phone": "+79990000110", "scheme_id": null, "channels": "stereo", "transcript": "010.txt"},
+  {"file": "011.wav", "phone": "+79990000011", "scheme_id": null, "channels": "mono", "transcript": "011.txt"},
+  {"file": "012.wav", "phone": "+79990000017", "scheme_id": null, "channels": "stereo", "transcript": "012.txt"}
+]

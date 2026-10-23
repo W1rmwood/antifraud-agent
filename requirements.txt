@@ -1,0 +1,28 @@
+# Python 3.12. Direct dependencies only, pinned to tested versions.
+
+# Data contracts and config
+pydantic==2.14.1
+pydantic-settings==2.16.1
+
+# LLM and embeddings (local Ollama)
+ollama==0.6.3
+
+# RAG: vector store, BM25, reranker
+chromadb==1.5.9
+rank-bm25==0.2.2
+FlashRank==0.2.10
+
+# Agent and tools
+langgraph==1.2.16
+mcp==2.3.0
+
+# Audio: speech recognition and voice activity detection
+faster-whisper==1.2.1
+silero-vad==6.2.3
+
+# UI
+streamlit==1.66.1
+
+# Tests
+pytest==9.1.1
+pytest-asyncio==1.4.0

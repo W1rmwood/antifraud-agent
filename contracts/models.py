@@ -160,3 +160,24 @@ class CallCase(Contract):
         if self.ended_at is not None and self.ended_at < self.started_at:
             raise ValueError("ended_at is before started_at")
         return self
+
+
+class CallRequest(Contract):
+    """What starts a call: where the audio comes from and who is calling."""
+
+    call_id: NonEmptyStr
+    source: AudioSource
+    phone: Phone | None = None
+
+
+class CallIndexEntry(Contract):
+    """One record of data/calls/index.json, paths relative to data/calls/.
+
+    In a stereo file the left channel is the caller and the right one is the user.
+    """
+
+    file: NonEmptyStr
+    phone: Phone | None
+    scheme_id: SchemeId | None  # None for a call without fraud
+    channels: Literal["stereo", "mono"]
+    transcript: NonEmptyStr

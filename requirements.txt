@@ -19,6 +19,8 @@ mcp==2.3.0
 # Audio: speech recognition and voice activity detection
 faster-whisper==1.2.1
 silero-vad==6.2.3
+soundfile==0.14.0
+scipy==1.17.1
 
 # UI
 streamlit==1.66.1

@@ -8,6 +8,8 @@ from contracts import (
     AgentEvent,
     AudioSource,
     CallCase,
+    CallIndexEntry,
+    CallRequest,
     EventType,
     NumberInfo,
     Scheme,
@@ -179,3 +181,41 @@ class TestStorageModels:
     def test_max_stage_must_be_positive(self) -> None:
         with pytest.raises(ValidationError):
             CallCase.model_validate(make_case(max_stage=0))
+
+
+def make_index_entry(**overrides: Any) -> dict[str, Any]:
+    entry = {
+        "file": "001.wav",
+        "phone": "+79990000001",
+        "scheme_id": "safe-account",
+        "channels": "stereo",
+        "transcript": "001.txt",
+    }
+    return entry | overrides
+
+
+class TestCallRequest:
+    def test_phone_is_optional(self) -> None:
+        request = CallRequest(call_id="c1", source=AudioSource(kind="mic"))
+        assert request.phone is None
+
+    def test_phone_must_be_normalized(self) -> None:
+        with pytest.raises(ValidationError):
+            CallRequest(call_id="c1", source=AudioSource(kind="mic"), phone="89991234567")
+
+
+class TestCallIndexEntry:
+    def test_valid_entry(self) -> None:
+        assert CallIndexEntry.model_validate(make_index_entry()).channels == "stereo"
+
+    def test_call_without_fraud(self) -> None:
+        entry = CallIndexEntry.model_validate(make_index_entry(scheme_id=None, phone=None))
+        assert entry.scheme_id is None
+
+    def test_unknown_channels_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            CallIndexEntry.model_validate(make_index_entry(channels="5.1"))
+
+    def test_scheme_id_must_be_slug(self) -> None:
+        with pytest.raises(ValidationError):
+            CallIndexEntry.model_validate(make_index_entry(scheme_id="Safe Account"))

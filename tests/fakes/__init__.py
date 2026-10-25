@@ -1,4 +1,4 @@
-"""Test doubles that satisfy the same contracts as the real modules."""
+"""Тестовые подмены, которые выполняют те же контракты, что и настоящие модули."""
 
 from tests.fakes.fake_listener import FakeListener, parse_transcript
 from tests.fakes.in_memory_storage import InMemoryStorage

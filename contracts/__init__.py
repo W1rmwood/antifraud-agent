@@ -1,3 +1,5 @@
+"""Контракты данных и интерфейсы модулей. Импортируй отсюда: `from contracts import Utterance`."""
+
 from contracts.interfaces import Listener, Storage
 from contracts.models import (
     AgentEvent,

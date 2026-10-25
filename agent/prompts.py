@@ -1,8 +1,8 @@
-"""Prompts and answer schemas for the LLM.
+"""Промпты и схемы ответов для LLM.
 
-The model only reports what it sees (scheme, stage, confidence, quotes).
-Whether to raise an alarm is decided in code by `agent.policy`, so the rule
-is testable and its threshold is tuned on eval instead of hidden in a prompt.
+Модель только сообщает, что видит (схему, этап, уверенность, цитаты).
+Поднимать ли тревогу, решает код в `agent.policy`. Так правило можно
+проверить тестами, а его порог подобрать в eval, а не прятать в промпте.
 """
 
 from typing import Literal
@@ -15,7 +15,11 @@ from rag.retriever import Hit
 SPEAKER_LABEL = {Speaker.caller: "Звонящий", Speaker.user: "Абонент", Speaker.unknown: "Голос"}
 
 
+# Описания полей (description) попадают в JSON-схему, которую получает модель,
+# поэтому они написаны для неё и на русском, как и весь промпт.
 class Analysis(BaseModel):
+    """Разбор текущего момента разговора."""
+
     scheme_id: str | None = Field(description="id схемы из списка кандидатов или null для обычного звонка")
     stage_n: int | None = Field(ge=1, description="номер этапа выбранной схемы или null")
     confidence: float = Field(ge=0.0, le=1.0, description="уверенность, что идёт именно эта схема")
@@ -29,6 +33,8 @@ class Analysis(BaseModel):
 
 
 class CallSummary(BaseModel):
+    """Отчёт о звонке для журнала."""
+
     legend: str | None = Field(description="кем представлялся звонящий или null")
     key_phrases: list[str] = Field(max_length=5, description="до пяти ключевых дословных фраз звонящего")
     summary: str = Field(description="2–3 предложения: что произошло в звонке")
@@ -55,14 +61,17 @@ SYSTEM_SUMMARY = """\
 
 
 def format_transcript(utterances: list[Utterance]) -> str:
+    """Реплики в виде «Звонящий: …» построчно."""
     return "\n".join(f"{SPEAKER_LABEL[u.speaker]}: {u.text}" for u in utterances)
 
 
 def format_candidates(hits: list[Hit]) -> str:
+    """Найденные этапы с пометкой [scheme_id, этап N], чтобы модель могла сослаться на id."""
     return "\n\n".join(f"[{h.scheme_id}, этап {h.stage_n}]\n{h.text}" for h in hits)
 
 
 def format_scheme(scheme: Scheme) -> str:
+    """Схема целиком, коротко: все этапы и тактики затягивания."""
     stages = "\n".join(f"  {s.n}. {s.name}: {s.goal}. Просят: {', '.join(s.asks_for) or '—'}" for s in scheme.stages)
     tactics = "\n".join(f"  - {t}" for t in scheme.stall_tactics)
     return f"{scheme.id} — {scheme.name}\nЭтапы:\n{stages}\nКак тянуть время:\n{tactics}"
@@ -71,8 +80,13 @@ def format_scheme(scheme: Scheme) -> str:
 def analysis_messages(
     window: list[Utterance], hits: list[Hit], current: Scheme | None, current_stage: int | None
 ) -> list[dict[str, str]]:
+    """Сообщения для разбора очередной реплики: кандидаты, текущая схема (если есть) и окно реплик."""
     parts = [f"Кандидаты:\n{format_candidates(hits)}"]
     if current is not None:
+        # Поиск по последним репликам может не найти уже объявленную схему
+        # (например, на этапе изоляции мошенник говорит общие слова).
+        # Поэтому схему целиком даём модели явно: так она может отслеживать
+        # этапы, даже если поиск этот этап не вернул.
         parts.append(
             f"Ранее определена схема (этап {current_stage}). Если разговор идёт по ней, "
             f"выбери её и актуальный этап:\n{format_scheme(current)}"
@@ -87,6 +101,7 @@ def analysis_messages(
 def summary_messages(
     transcript: list[Utterance], scheme: Scheme | None, max_stage: int | None
 ) -> list[dict[str, str]]:
+    """Сообщения для итогового отчёта: вывод агента и полная расшифровка звонка."""
     verdict = (
         f"Агент определил схему «{scheme.name}», дошли до этапа {max_stage}."
         if scheme is not None

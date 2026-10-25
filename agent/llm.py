@@ -1,37 +1,46 @@
-"""Structured LLM calls: the answer is always a validated Pydantic model.
+"""Вызовы LLM со структурированным ответом: результат — всегда проверенная Pydantic-модель.
 
-Ollama's `format` constrains decoding to the JSON schema, but a small model
-can still produce JSON that fails validation (a value out of range, an empty
-required string). Then the error goes back to the model and it gets another try.
+Параметр `format` в Ollama ограничивает генерацию JSON-схемой, но маленькая
+модель всё равно может выдать JSON, который не проходит проверку (число вне
+диапазона, пустая обязательная строка). Тогда ошибка возвращается модели,
+и у неё есть ещё попытка.
 """
 
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
-import httpx  # transport of the ollama client; its timeouts are not wrapped by ollama
+import httpx  # транспорт клиента ollama; его таймауты ollama не оборачивает в свои ошибки
 import ollama
 from pydantic import BaseModel, ValidationError
 
 log = logging.getLogger(__name__)
 
 Messages = list[dict[str, str]]
-# Sends messages with a JSON schema, returns the raw text of the answer.
+# Функция, которая отправляет сообщения вместе с JSON-схемой и возвращает сырой текст ответа.
+# Вынесена отдельно, чтобы логику повторов можно было проверить без Ollama.
 RawChat = Callable[[Messages, dict[str, Any]], Awaitable[str]]
 
 
 class LLMError(Exception):
-    """The model is unreachable or gave no valid answer after all retries."""
+    """Модель недоступна или не дала валидного ответа за все попытки."""
 
 
 class LLM(Protocol):
+    """Всё, что по сообщениям возвращает ответ в виде заданной Pydantic-модели."""
+
     async def generate[T: BaseModel](self, messages: Messages, schema: type[T]) -> T: ...
 
 
 async def generate_structured[T: BaseModel](
     chat: RawChat, messages: Messages, schema: type[T], retries: int
 ) -> T:
-    history = list(messages)
+    """Спрашивает модель, пока ответ не пройдёт проверку схемой, но не больше `retries + 1` раз.
+
+    При неудаче в историю добавляются невалидный ответ модели и текст ошибки:
+    модель видит, что именно не так, и исправляет, а не генерирует наугад заново.
+    """
+    history = list(messages)  # копия: не портим список, который передал вызывающий код
     json_schema = schema.model_json_schema()
     for attempt in range(retries + 1):
         raw = await chat(history, json_schema)
@@ -50,6 +59,8 @@ async def generate_structured[T: BaseModel](
 
 
 class OllamaLLM:
+    """Настоящая LLM через асинхронный клиент Ollama: не блокирует event loop во время генерации."""
+
     def __init__(
         self, model: str, host: str, *, temperature: float = 0.0, retries: int = 2, timeout_s: float = 120.0
     ) -> None:
@@ -59,15 +70,19 @@ class OllamaLLM:
         self._retries = retries
 
     async def generate[T: BaseModel](self, messages: Messages, schema: type[T]) -> T:
+        """Ответ модели в виде `schema`, с повтором при невалидном JSON."""
         return await generate_structured(self._chat, messages, schema, self._retries)
 
     async def _chat(self, messages: Messages, json_schema: dict[str, Any]) -> str:
+        """Один запрос к Ollama. Сетевые ошибки превращаются в LLMError, чтобы агент обрабатывал один тип."""
         try:
             response = await self._client.chat(
                 model=self.model,
                 messages=messages,
                 format=json_schema,
-                think=False,  # qwen3 reasoning adds seconds of latency per utterance
+                # Режим рассуждений qwen3 добавляет секунды задержки на каждую реплику,
+                # а подсказка нужна, пока мошенник ещё на линии.
+                think=False,
                 options=self._options,
             )
         except (ollama.ResponseError, ConnectionError, httpx.TimeoutException) as error:

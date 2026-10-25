@@ -1,8 +1,10 @@
-"""MCP server with the agent's tools: scheme search, scheme lookup and call history.
+"""MCP-сервер с инструментами агента: поиск схем, получение схемы и история звонков.
 
-`build_server` takes its dependencies explicitly, so tests pass fakes and the
-agent can run the server in-process. `python -m mcp_server.server` starts the
-real one over stdio.
+`build_server` получает зависимости явно: тесты передают фейки, а агент может
+запустить сервер в своём же процессе. `python -m mcp_server.server` запускает
+настоящий сервер по stdio.
+
+Docstring каждого инструмента — это его описание для MCP-клиента.
 """
 
 import asyncio
@@ -26,42 +28,52 @@ INSTRUCTIONS = (
 def build_server(
     retriever: Retriever, storage: Storage | ModuleType, schemes: dict[str, Scheme]
 ) -> MCPServer:
+    """Создаёт MCP-сервер с пятью инструментами поверх переданных поиска, хранилища и схем.
+
+    `storage` — модуль storage.db (функции уровня модуля) или объект вроде
+    InMemoryStorage: оба подходят под протокол Storage.
+    """
     server = MCPServer("antifraud", instructions=INSTRUCTIONS)
+
+    # MCP SDK строит схему входа по аннотациям аргументов, а схему выхода —
+    # по аннотации возврата. Поэтому Pydantic-модели (Hit, Scheme, CallCase)
+    # уходят клиенту как структурированный JSON, а не как текст.
 
     @server.tool()
     async def search_schemes(query: str, k: int = 5) -> list[Hit]:
-        """Find fraud scheme stages most similar to the caller's words."""
+        """Найти этапы схем мошенничества, больше всего похожие на слова звонящего."""
         return await retriever.asearch(query, k)
 
     @server.tool()
     async def get_scheme(scheme_id: str) -> Scheme:
-        """Return a fraud scheme with all its stages."""
+        """Вернуть схему мошенничества со всеми этапами."""
         if scheme_id not in schemes:
             raise ToolError(f"unknown scheme: {scheme_id}")
         return schemes[scheme_id]
 
     @server.tool()
     async def lookup_number(phone: str) -> NumberInfo:
-        """History of a phone number: how many calls, which schemes, tags."""
+        """История номера телефона: сколько звонков, какие схемы, метки."""
         return await _storage_call(storage.lookup_number, phone)
 
     @server.tool()
     async def save_case(case: CallCase) -> str:
-        """Save the report of a finished call; returns call_id."""
+        """Сохранить отчёт о завершённом звонке; возвращает call_id."""
         return await _storage_call(storage.save_case, case)
 
     @server.tool()
     async def list_recent_cases(limit: int = 20) -> list[CallCase]:
-        """Most recent saved calls, newest first."""
+        """Последние сохранённые звонки, от новых к старым."""
         return await _storage_call(storage.list_recent_cases, limit)
 
     return server
 
 
 async def _storage_call[T](func: Callable[..., T], *args: object) -> T:
-    # Storage is synchronous SQLite: keep it off the event loop. A ValueError
-    # there means bad input (e.g. a foreign phone number), which the caller
-    # should see as a failed tool, not as a server crash.
+    """Вызывает синхронную функцию хранилища в отдельном потоке."""
+    # Хранилище — синхронный SQLite, поэтому выносим вызов из event loop.
+    # ValueError там означает плохой ввод (например, иностранный номер):
+    # клиент должен увидеть ошибку инструмента (ToolError), а не падение сервера.
     try:
         return await asyncio.to_thread(func, *args)
     except ValueError as error:
@@ -69,8 +81,10 @@ async def _storage_call[T](func: Callable[..., T], *args: object) -> T:
 
 
 def build_default_server(settings: Settings, retriever: Retriever | None = None) -> MCPServer:
-    """Server on the real SQLite storage. Pass `retriever` to share an already loaded index."""
-    from storage import db  # noqa: PLC0415  real SQLite only when running for real
+    """Сервер на настоящем SQLite. Передай `retriever`, чтобы не загружать индекс второй раз."""
+    # Настоящее хранилище импортируем только при реальном запуске:
+    # тестам с фейками SQLite не нужен.
+    from storage import db  # noqa: PLC0415
 
     db.init_db(settings.db_path)
     return build_server(
@@ -79,6 +93,7 @@ def build_default_server(settings: Settings, retriever: Retriever | None = None)
 
 
 def main() -> None:
+    """Точка входа `python -m mcp_server.server`: сервер по stdio."""
     build_default_server(get_settings()).run("stdio")
 
 

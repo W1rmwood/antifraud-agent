@@ -1,8 +1,8 @@
-"""Listener that reads a text transcript instead of audio.
+"""Слушатель, который читает текстовую расшифровку вместо звука.
 
-Satisfies `contracts.Listener`: `FakeListener()(source, call_id)` yields
-`Utterance`s, so the agent cannot tell it from the real audio module.
-Timings are synthetic: each phrase lasts proportionally to its word count.
+Выполняет контракт `contracts.Listener`: `FakeListener()(source, call_id)`
+выдаёт `Utterance`, так что агент не отличит его от настоящего модуля звука.
+Время фраз условное: длительность пропорциональна числу слов.
 """
 
 import asyncio
@@ -12,14 +12,15 @@ from pathlib import Path
 
 from contracts import AudioSource, Speaker, Utterance
 
+# Строка вида "caller: текст". Регистр имени говорящего не важен, пробелы вокруг двоеточия — тоже.
 _LINE = re.compile(r"^\s*(caller|user|unknown)\s*:\s*(.+?)\s*$", re.IGNORECASE)
 
-WORDS_PER_SECOND = 2.5
-PAUSE_S = 0.4
+WORDS_PER_SECOND = 2.5  # примерный темп разговорной речи
+PAUSE_S = 0.4  # пауза между фразами
 
 
 def parse_transcript(text: str) -> list[tuple[Speaker, str]]:
-    """Parse `speaker: phrase` lines; blank lines are skipped, anything else is an error."""
+    """Разбирает строки `говорящий: фраза`. Пустые строки пропускаются, всё остальное — ошибка."""
     lines: list[tuple[Speaker, str]] = []
     for number, raw in enumerate(text.splitlines(), start=1):
         if not raw.strip():
@@ -32,9 +33,9 @@ def parse_transcript(text: str) -> list[tuple[Speaker, str]]:
 
 
 class FakeListener:
-    """Replays a transcript file (`source.path`) or a list of lines given in the constructor.
+    """Проигрывает файл расшифровки (`source.path`) или список строк, переданный в конструктор.
 
-    `delay_s` sleeps between utterances to imitate a live call; 0 replays instantly.
+    `delay_s` — пауза между фразами, чтобы изобразить живой звонок; 0 — мгновенно.
     """
 
     def __init__(self, lines: list[tuple[Speaker, str]] | None = None, delay_s: float = 0.0) -> None:
@@ -42,6 +43,8 @@ class FakeListener:
         self._delay_s = delay_s
 
     async def __call__(self, source: AudioSource, call_id: str) -> AsyncIterator[Utterance]:
+        # Асинхронный генератор: вызов возвращает итератор, который читают через `async for`,
+        # ровно как настоящий audio.stream.listen.
         lines = self._lines
         if lines is None:
             if source.path is None:
@@ -50,6 +53,7 @@ class FakeListener:
 
         t = 0.0
         for seq, (speaker, text) in enumerate(lines):
+            # Не короче полсекунды: даже «да» занимает какое-то время.
             duration = max(len(text.split()) / WORDS_PER_SECOND, 0.5)
             if seq and self._delay_s:
                 await asyncio.sleep(self._delay_s)

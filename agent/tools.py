@@ -1,4 +1,4 @@
-"""MCP client side: every tool call is mirrored to the UI as tool_call / tool_result events."""
+"""Клиентская сторона MCP: каждый вызов инструмента дублируется в UI событиями tool_call / tool_result."""
 
 import logging
 from dataclasses import dataclass
@@ -16,17 +16,30 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ToolResult:
+    """Результат вызова инструмента."""
+
     ok: bool
-    result: Any  # the tool's value, or the error text when not ok
+    result: Any  # значение инструмента или, если ok=False, текст ошибки
 
 
 class ToolClient:
+    """Обёртка над MCP-клиентом, которая отправляет события и никогда не бросает исключения.
+
+    Упавший инструмент не должен обрывать звонок: агент получает ok=False
+    и решает сам, что делать дальше (например, продолжить без истории номера).
+    """
+
     def __init__(self, client: Client, sink: EventSink) -> None:
         self._client = client
         self._sink = sink
 
     async def call(self, tool: str, args: dict[str, Any]) -> ToolResult:
+        """Вызывает инструмент `tool` с аргументами `args`."""
         await self._sink.emit(EventType.tool_call, {"tool": tool, "args": args})
+        # Ошибка в MCP приходит двумя путями:
+        # - MCPError — сбой протокола (нет такого инструмента, неверные аргументы);
+        # - is_error=True — инструмент сам сообщил об ошибке (например, ToolError
+        #   на иностранный номер). Текст ошибки тогда лежит в content.
         try:
             response = await self._client.call_tool(tool, args)
         except MCPError as error:
@@ -44,7 +57,9 @@ class ToolClient:
 
 
 def _unwrap(content: dict[str, Any] | None) -> Any:
-    # MCP wraps non-object results (str, list) as {"result": value}.
+    """Достаёт значение инструмента из обёртки MCP."""
+    # Структурированный результат в MCP — всегда объект. Поэтому строку или
+    # список (save_case, search_schemes) MCP заворачивает в {"result": значение}.
     if content is not None and set(content) == {"result"}:
         return content["result"]
     return content

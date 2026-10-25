@@ -1,13 +1,14 @@
-"""Quality metrics in one command: `python -m eval.run_eval`.
+"""Метрики качества одной командой: `python -m eval.run_eval`.
 
-1. Retrieval: hit@1, hit@k, MRR of the expected scheme for every search mode
-   (vector / bm25 / hybrid / hybrid + reranker) on fraud fragments.
-2. Agent: scheme and stage accuracy, false alarms on ordinary calls and
-   latency from utterance to answer, for every LLM model asked for.
-3. Threshold sweep: the alarm rule replayed over recorded LLM answers.
+1. Поиск: hit@1, hit@k и MRR правильной схемы для каждого режима поиска
+   (векторы / BM25 / гибрид / гибрид + реранкер) на мошеннических фрагментах.
+2. Агент: точность схемы и этапа, ложные тревоги на обычных звонках и
+   задержка от реплики до ответа, для каждой запрошенной модели LLM.
+3. Подбор порога: правило тревоги, пересчитанное по записанным ответам LLM.
 
-Parts that need Ollama, the Chroma index or the reranker model are reported
-as unavailable instead of failing, so BM25 numbers are there on any machine.
+Части, которым нужны Ollama, индекс Chroma или модель реранкера, при их
+отсутствии помечаются в отчёте как недоступные, а не роняют прогон.
+Поэтому цифры BM25 получаются на любой машине.
 """
 
 import argparse
@@ -40,25 +41,32 @@ THRESHOLDS = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 RESULTS_DIR = Path("eval/results")
 
 
-# --- retrieval ---
+# --- поиск ---
 
 
 @dataclass
 class RetrievalRow:
+    """Строка таблицы поиска: метрики одного режима."""
+
     mode: str
-    hit1: float = 0.0
-    hitk: float = 0.0
-    mrr: float = 0.0
-    stage_hitk: float = 0.0  # the exact expected stage is among top-k chunks
-    latency_ms: float = 0.0
-    unavailable: str | None = None
+    hit1: float = 0.0  # правильная схема на первом месте
+    hitk: float = 0.0  # правильная схема среди первых k
+    mrr: float = 0.0  # среднее 1 / место правильной схемы; 1.0 — всегда первая
+    stage_hitk: float = 0.0  # среди первых k есть именно ожидаемый этап, а не только схема
+    latency_ms: float = 0.0  # медиана времени одного поиска
+    unavailable: str | None = None  # почему режим не посчитан
 
 
 def caller_text(case: EvalCase) -> str:
+    """Слова звонящего из фрагмента одной строкой — так же, как ищет агент."""
     return " ".join(u.text for u in case.utterances if u.speaker != "user")
 
 
 def eval_retrieval(retriever: Retriever, cases: list[EvalCase], mode: RetrievalMode, k: int) -> RetrievalRow:
+    """Считает метрики поиска одного режима на мошеннических фрагментах.
+
+    Обычные звонки здесь не участвуют: у них нет правильной схемы, которую можно найти.
+    """
     fraud = [c for c in cases if c.is_fraud]
     hit1 = hitk = rr = stage_hit = 0.0
     latencies = []
@@ -68,6 +76,7 @@ def eval_retrieval(retriever: Retriever, cases: list[EvalCase], mode: RetrievalM
         latencies.append(time.perf_counter() - started)
         schemes = [h.scheme_id for h in hits]
         if case.expected_scheme in schemes:
+            # Место первого вхождения схемы: у одной схемы в выдаче может быть несколько этапов.
             rank = schemes.index(case.expected_scheme) + 1
             hit1 += rank == 1
             hitk += 1
@@ -78,13 +87,17 @@ def eval_retrieval(retriever: Retriever, cases: list[EvalCase], mode: RetrievalM
 
 
 def build_eval_retriever(settings: Settings) -> tuple[Retriever, dict[str, str]]:
-    """Retriever with whatever components are available; reasons for the missing ones."""
+    """Поиск из тех компонентов, что доступны, плюс причины, почему остальных нет.
+
+    Возвращает (поиск, {режим: причина недоступности}).
+    """
     chunks = scheme_chunks(load_schemes(settings.schemes_dir))
     missing: dict[str, str] = {}
     embedder = collection = reranker = None
     try:
         collection = open_index(settings.chroma_dir, chunks, settings.embed_model)
         embedder = OllamaEmbedder(settings.embed_model, settings.ollama_host)
+        # Пробный запрос: сразу узнаём, отвечает ли Ollama, а не посреди прогона.
         embedder.embed(["проверка"])
     except (RuntimeError, ConnectionError, ollama.ResponseError) as error:
         embedder = collection = None
@@ -92,7 +105,7 @@ def build_eval_retriever(settings: Settings) -> tuple[Retriever, dict[str, str]]
             missing[mode] = f"нет векторного поиска: {error}"
     try:
         reranker = FlashRankReranker(settings.reranker_model, settings.reranker_cache_dir)
-    except Exception as error:  # noqa: BLE001  any download/onnx failure just disables this row
+    except Exception as error:  # noqa: BLE001  любой сбой скачивания или onnx просто выключает эту строку
         missing.setdefault("hybrid_rerank", f"нет реранкера: {error}")
     retriever = Retriever(
         chunks,
@@ -106,24 +119,28 @@ def build_eval_retriever(settings: Settings) -> tuple[Retriever, dict[str, str]]
     return retriever, missing
 
 
-# --- agent ---
+# --- агент ---
 
 
 @dataclass
 class CaseRun:
+    """Результат прогона агента на одном фрагменте."""
+
     case: EvalCase
-    scheme_id: str | None
-    stage_n: int | None
-    turns: list[Turn]
+    scheme_id: str | None  # что объявил агент к концу фрагмента
+    stage_n: int | None  # самый дальний этап (max_stage)
+    turns: list[Turn]  # ответы LLM по ходам — для пересчёта порога
 
 
 @dataclass
 class AgentRow:
+    """Строка таблицы агента: метрики одной модели."""
+
     model: str
-    scheme_acc: float = 0.0  # fraud fragments with the right scheme declared
-    stage_acc: float = 0.0  # ...and the right stage
-    false_alarms: float = 0.0  # ordinary calls where any scheme was declared
-    accuracy: float = 0.0  # all fragments: right scheme or rightly nothing
+    scheme_acc: float = 0.0  # доля мошеннических фрагментов, где объявлена правильная схема
+    stage_acc: float = 0.0  # ...и при этом правильный этап
+    false_alarms: float = 0.0  # доля обычных звонков, где объявлена хоть какая-то схема
+    accuracy: float = 0.0  # все фрагменты: правильная схема или правильно «ничего»
     p50_s: float = 0.0
     p95_s: float = 0.0
     llm_failures: int = 0
@@ -132,9 +149,12 @@ class AgentRow:
 
 
 async def run_case(case: EvalCase, deps: AgentDeps, server: object) -> CaseRun:
+    """Прогоняет агента по одному фрагменту, реплика за репликой, как в живом звонке."""
     sink = EventSink(case.id)
     async with Client(server) as client:  # type: ignore[arg-type]
         agent = CallAgent(case.id, deps, sink, ToolClient(client, sink))
+        # В наборе нет времени реплик: подставляем условные 3 секунды на фразу
+        # и полсекунды паузы. На метрики это не влияет.
         t = 0.0
         for seq, u in enumerate(case.utterances):
             await agent.on_utterance(
@@ -146,6 +166,7 @@ async def run_case(case: EvalCase, deps: AgentDeps, server: object) -> CaseRun:
 
 
 def score(model: str, runs: list[CaseRun]) -> AgentRow:
+    """Сводит прогоны одной модели в метрики."""
     fraud = [r for r in runs if r.case.is_fraud]
     normal = [r for r in runs if not r.case.is_fraud]
     right_scheme = [r for r in fraud if r.scheme_id == r.case.expected_scheme]
@@ -154,19 +175,25 @@ def score(model: str, runs: list[CaseRun]) -> AgentRow:
     return AgentRow(
         model=model,
         scheme_acc=len(right_scheme) / len(fraud),
+        # Этап засчитывается только при правильной схеме: «этап 2» чужой схемы — не попадание.
         stage_acc=sum(r.stage_n == r.case.expected_stage for r in right_scheme) / len(fraud),
         false_alarms=sum(r.scheme_id is not None for r in normal) / len(normal),
         accuracy=correct / len(runs),
         p50_s=statistics.median(latencies),
         p95_s=latencies[min(len(latencies) - 1, int(0.95 * len(latencies)))],
+        # Сбой — ход, где поиск дал кандидатов, а ответа LLM нет.
         llm_failures=sum(t.analysis is None for r in runs for t in r.turns if t.candidates),
         runs=runs,
     )
 
 
 def replay(run: CaseRun, threshold: float, schemes: dict[str, Scheme]) -> tuple[str | None, int | None]:
-    """The alarm rule over recorded answers. Approximate: the prompt mentions the
-    current scheme, so a different threshold could have changed later answers."""
+    """Применяет правило тревоги к записанным ответам модели с другим порогом.
+
+    Это приближение: в промпт попадает уже объявленная схема, поэтому
+    с другим порогом модель могла бы ответить на следующих ходах иначе.
+    Зато подбор порога не требует перезапускать LLM на каждое значение.
+    """
     scheme_id: str | None = None
     stage: int | None = None
     max_stage: int | None = None
@@ -176,6 +203,7 @@ def replay(run: CaseRun, threshold: float, schemes: dict[str, Scheme]) -> tuple[
         decision = decide(turn.analysis, turn.caller_text, set(turn.candidates), threshold, scheme_id, stage)
         if decision.scheme_id != scheme_id:
             scheme_id, stage = decision.scheme_id, None
+        # Та же проверка номера этапа, что в CallAgent._update_stage.
         if scheme_id and decision.stage_n and 1 <= decision.stage_n <= len(schemes[scheme_id].stages):
             stage = decision.stage_n
             max_stage = max(max_stage or 0, stage)
@@ -183,7 +211,11 @@ def replay(run: CaseRun, threshold: float, schemes: dict[str, Scheme]) -> tuple[
 
 
 def threshold_sweep(row: AgentRow, schemes: dict[str, Scheme]) -> list[tuple[float, float, float]]:
-    """(threshold, scheme accuracy on fraud, false alarm rate) per threshold."""
+    """Для каждого порога: (порог, доля найденных схем, доля ложных тревог).
+
+    Чем выше порог, тем меньше ложных тревог, но и тем больше пропущенных
+    мошенников. Таблица показывает, где компромисс.
+    """
     fraud = [r for r in row.runs if r.case.is_fraud]
     normal = [r for r in row.runs if not r.case.is_fraud]
     sweep = []
@@ -195,10 +227,12 @@ def threshold_sweep(row: AgentRow, schemes: dict[str, Scheme]) -> list[tuple[flo
 
 
 def missing_model(settings: Settings, model: str) -> str | None:
+    """Почему модель нельзя прогнать (Ollama не запущена или модель не скачана), или None."""
     try:
         installed = {m.model for m in ollama.Client(host=settings.ollama_host).list().models}
     except ConnectionError as error:
         return f"Ollama недоступна: {error}"
+    # Ollama хранит модель без тега как "<имя>:latest".
     if model not in installed and f"{model}:latest" not in installed:
         return f"модель не скачана: ollama pull {model}"
     return None
@@ -207,23 +241,29 @@ def missing_model(settings: Settings, model: str) -> str | None:
 async def eval_agent(
     settings: Settings, model: str, retriever: Retriever, mode: RetrievalMode, cases: list[EvalCase]
 ) -> AgentRow:
+    """Прогоняет агента с моделью `model` по всему набору."""
     if reason := missing_model(settings, model):
         return AgentRow(model=model, unavailable=reason)
-    from storage import db  # noqa: PLC0415  real storage on a throwaway file
+    # Настоящее хранилище, но на временном файле: прогон не должен
+    # засорять рабочую базу тестовыми кейсами.
+    from storage import db  # noqa: PLC0415
 
     db.init_db(str(Path(tempfile.mkdtemp()) / "eval.db"))
     run_settings = settings.model_copy(update={"llm_model": model, "retrieval_mode": mode})
     llm = OllamaLLM(model, settings.ollama_host, temperature=settings.llm_temperature, retries=settings.llm_retries)
     deps = AgentDeps(retriever=retriever, llm=llm, settings=run_settings)
     server = build_server(retriever, db, load_schemes(settings.schemes_dir))
+    # Фрагменты по очереди, не параллельно: иначе модели в Ollama
+    # конкурировали бы за CPU/GPU, и замер задержки был бы нечестным.
     runs = [await run_case(case, deps, server) for case in cases]
     return score(model, runs)
 
 
-# --- report ---
+# --- отчёт ---
 
 
 def pct(x: float) -> str:
+    """Доля в процентах без дробной части: 0.894 → "89%"."""
     return f"{100 * x:.0f}%"
 
 
@@ -236,6 +276,7 @@ def render(
     agents: list[AgentRow],
     schemes: dict[str, Scheme],
 ) -> str:
+    """Собирает отчёт в Markdown: таблица поиска, таблица агента, подбор порога и список ошибок."""
     fraud = sum(c.is_fraud for c in cases)
     lines = [
         f"# Оценка качества — {datetime.now():%Y-%m-%d %H:%M}",
@@ -287,6 +328,7 @@ def render(
             "|---|---|---|",
         ]
         lines += [f"| {th} | {pct(found)} | {pct(alarms)} |" for th, found, alarms in threshold_sweep(a, schemes)]
+        # Список ошибок по id фрагментов: по нему удобно разбирать, что пошло не так.
         errors = [r for r in a.runs if r.scheme_id != r.case.expected_scheme]
         if errors:
             lines += ["", f"Ошибки {a.model}:", ""]
@@ -295,6 +337,7 @@ def render(
 
 
 def main() -> None:
+    """Точка входа `python -m eval.run_eval`: считает всё доступное и пишет отчёт в eval/results/."""
     parser = argparse.ArgumentParser(description="Evaluate retrieval and the agent on data/eval/cases.jsonl.")
     parser.add_argument("--models", nargs="+", default=["qwen3:8b", "qwen3:4b"])
     parser.add_argument("--agent-mode", default=None, help="retrieval mode for the agent (default: best available)")
@@ -314,7 +357,9 @@ def main() -> None:
         for mode in MODES
     ]
 
-    available = [m for m in reversed(MODES) if m not in missing]  # best first
+    # Агент по умолчанию работает с самым полным доступным режимом поиска:
+    # MODES перечислены от простого к сложному, reversed даёт лучший первым.
+    available = [m for m in reversed(MODES) if m not in missing]
     agent_mode: RetrievalMode = args.agent_mode or available[0]
     agents: list[AgentRow] = []
     if not args.skip_agent:

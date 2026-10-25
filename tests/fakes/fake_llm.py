@@ -1,4 +1,4 @@
-"""LLM stand-in: answers are produced by a function of the prompt, no model is run."""
+"""Подмена LLM: ответы вычисляет функция от промпта, модель не запускается."""
 
 from collections.abc import Callable
 
@@ -7,21 +7,23 @@ from pydantic import BaseModel
 from agent.llm import LLMError, Messages
 from agent.prompts import Analysis, CallSummary
 
+# Правило фейка: по тексту промпта решает, что «ответила бы» модель.
 AnalysisRule = Callable[[str], Analysis]
 
 
 class FakeLLM:
-    """`analyze` maps the user prompt to an Analysis; raising LLMError imitates a dead model.
+    """`analyze` превращает промпт в Analysis; если оно бросает LLMError — это «упавшая» модель.
 
-    `summary=None` makes the summary call fail, to exercise the fallback.
+    `summary=None` заставляет вызов отчёта упасть, чтобы проверить запасной вариант.
     """
 
     def __init__(self, analyze: AnalysisRule, summary: CallSummary | None = None) -> None:
         self._analyze = analyze
         self._summary = summary
-        self.prompts: list[str] = []
+        self.prompts: list[str] = []  # все полученные промпты: тесты проверяют, что в них попало
 
     async def generate[T: BaseModel](self, messages: Messages, schema: type[T]) -> T:
+        """Тот же интерфейс, что у OllamaLLM. Отвечает по типу запрошенной схемы."""
         prompt = messages[-1]["content"]
         self.prompts.append(prompt)
         if schema is Analysis:
@@ -34,6 +36,7 @@ class FakeLLM:
 
 
 def no_fraud(prompt: str) -> Analysis:
+    """Правило «обычный звонок»: схемы нет, уверенность низкая."""
     return Analysis(
         scheme_id=None,
         stage_n=None,

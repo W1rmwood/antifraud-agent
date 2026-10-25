@@ -1,7 +1,12 @@
-"""Hybrid search over scheme stages: vectors + BM25, fused with RRF, then reranked.
+"""Гибридный поиск по этапам схем: векторы + BM25, слияние через RRF, затем реранкер.
 
-Every mode is kept selectable (`vector`, `bm25`, `hybrid`, `hybrid_rerank`)
-because eval compares them; the agent uses whichever the config says.
+Все режимы оставлены переключаемыми (`vector`, `bm25`, `hybrid`, `hybrid_rerank`),
+потому что eval сравнивает их между собой. Агент использует тот, что задан в настройках.
+
+Зачем два поиска сразу:
+- векторы ловят смысл, даже если слова другие («переведите на резервный счёт»
+  ≈ «отправьте на защищённую ячейку»);
+- BM25 ловит точные слова, которые векторы иногда размывают («СНИЛС», «CVV»).
 """
 
 import asyncio
@@ -19,6 +24,13 @@ from rag.index import COLLECTION, fingerprint, open_client
 
 
 class Hit(BaseModel):
+    """Один результат поиска: найденный этап и его оценка.
+
+    Шкала score зависит от режима: косинусная близость, оценка BM25,
+    сумма RRF или оценка реранкера. Сравнивать score можно только внутри
+    одной выдачи, не между режимами.
+    """
+
     chunk_id: str
     scheme_id: str
     stage_n: int
@@ -28,20 +40,31 @@ class Hit(BaseModel):
 
 
 class Reranker(Protocol):
+    """Переоценивает кандидатов: возвращает по одной оценке на чанк, в том же порядке."""
+
     def score(self, query: str, chunks: list[Chunk]) -> list[float]: ...
 
 
 class FlashRankReranker:
-    """Cross-encoder reranker. Downloads the model into `cache_dir` on first use."""
+    """Реранкер на кросс-энкодере. При первом запуске скачивает модель в `cache_dir`.
+
+    Кросс-энкодер читает запрос и чанк вместе, поэтому точнее векторов,
+    но медленнее. Его запускают только на 20 лучших кандидатах после слияния,
+    а не на всей базе.
+    """
 
     def __init__(self, model_name: str, cache_dir: str) -> None:
-        from flashrank import Ranker  # noqa: PLC0415  heavy import, only when reranking is on
+        # Тяжёлый импорт (onnxruntime), поэтому только когда реранкер включён.
+        from flashrank import Ranker  # noqa: PLC0415
 
         self._ranker = Ranker(model_name=model_name, cache_dir=cache_dir)
 
     def score(self, query: str, chunks: list[Chunk]) -> list[float]:
         from flashrank import RerankRequest  # noqa: PLC0415
 
+        # FlashRank возвращает пассажи, отсортированные по оценке. Чтобы вернуть
+        # оценки в исходном порядке чанков, кладём в id индекс чанка и
+        # раскладываем результат обратно по этим индексам.
         passages = [{"id": i, "text": c.text} for i, c in enumerate(chunks)]
         ranked = self._ranker.rerank(RerankRequest(query=query, passages=passages))
         scores = [0.0] * len(chunks)
@@ -51,9 +74,12 @@ class FlashRankReranker:
 
 
 def rrf(rankings: list[list[str]], k: int) -> dict[str, float]:
-    """Reciprocal Rank Fusion: sum of 1 / (k + rank) over every ranking a document appears in.
+    """Reciprocal Rank Fusion: для каждого документа сумма 1 / (k + место) по всем выдачам.
 
-    Uses ranks, not scores, so cosine distances and BM25 scores need no common scale.
+    Работает с местами в выдаче, а не с оценками. Поэтому косинусную близость
+    и оценку BM25 не нужно приводить к одной шкале. Документ, который высоко
+    в обеих выдачах, получает больше всего. k (обычно 60) сглаживает разницу
+    между первым и вторым местом, чтобы одна выдача не перевешивала другую.
     """
     fused: dict[str, float] = {}
     for ranking in rankings:
@@ -63,6 +89,13 @@ def rrf(rankings: list[list[str]], k: int) -> dict[str, float]:
 
 
 class Retriever:
+    """Поиск этапов схем по тексту звонящего.
+
+    Компоненты передаются в конструктор: в тестах — фейки, в работе —
+    настоящие (см. `from_settings`). Режим без векторов (`bm25`) работает
+    без Ollama и без индекса Chroma.
+    """
+
     def __init__(
         self,
         chunks: list[Chunk],
@@ -76,6 +109,8 @@ class Retriever:
         stem_len: int = 5,
     ) -> None:
         self._chunks = {c.id: c for c in chunks}
+        # BM25 возвращает оценки списком в порядке документов, без id.
+        # Этот список сопоставляет позицию оценки с id чанка.
         self._order = [c.id for c in chunks]
         self._embedder = embedder
         self._collection = collection
@@ -88,6 +123,7 @@ class Retriever:
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "Retriever":
+        """Собирает настоящий поиск по настройкам. Загружает только то, что нужно режиму."""
         chunks = scheme_chunks(load_schemes(settings.schemes_dir))
         embedder = collection = reranker = None
         if settings.retrieval_mode != "bm25":
@@ -107,6 +143,7 @@ class Retriever:
         )
 
     def search(self, query: str, k: int = 5, mode: RetrievalMode | None = None) -> list[Hit]:
+        """Возвращает k лучших этапов. `mode` позволяет eval сравнить режимы на одном индексе."""
         mode = mode or self._mode
         if mode == "bm25":
             scored = self._bm25_search(query)
@@ -121,15 +158,19 @@ class Retriever:
         return [self._hit(chunk_id, score) for chunk_id, score in scored[:k]]
 
     async def asearch(self, query: str, k: int = 5, mode: RetrievalMode | None = None) -> list[Hit]:
+        """То же, что search, но в отдельном потоке: эмбеддинги и реранкер не блокируют event loop."""
         return await asyncio.to_thread(self.search, query, k, mode)
 
     def _bm25_search(self, query: str) -> list[tuple[str, float]]:
+        """Лучшие кандидаты по BM25 в виде пар (id чанка, оценка)."""
         scores = self._bm25.get_scores(tokenize(query, self._stem_len))
         ranked = sorted(zip(self._order, scores), key=lambda item: item[1], reverse=True)
-        # Chunks without a single shared token are not candidates at all.
+        # Чанк без единого общего слова с запросом — вообще не кандидат.
+        # Иначе в RRF попали бы случайные чанки с нулевой оценкой.
         return [(i, float(s)) for i, s in ranked[: self._candidates_k] if s > 0]
 
     def _vector_search(self, query: str) -> list[tuple[str, float]]:
+        """Лучшие кандидаты по косинусной близости эмбеддингов."""
         if self._embedder is None or self._collection is None:
             raise RuntimeError("vector search needs an embedder and a Chroma collection")
         [vector] = self._embedder.embed([query])
@@ -138,15 +179,19 @@ class Retriever:
         )
         distances = result["distances"]
         assert distances is not None
-        return [(i, 1.0 - d) for i, d in zip(result["ids"][0], distances[0])]  # cosine similarity
+        # Chroma отдаёт косинусное расстояние (0 — одинаковые). Переводим
+        # в близость, чтобы во всех режимах «больше» значило «лучше».
+        return [(i, 1.0 - d) for i, d in zip(result["ids"][0], distances[0])]
 
     def _rerank(self, query: str, chunk_ids: list[str]) -> list[tuple[str, float]]:
+        """Пересортировывает кандидатов по оценке реранкера."""
         if self._reranker is None:
             raise RuntimeError("mode 'hybrid_rerank' needs a reranker")
         scores = self._reranker.score(query, [self._chunks[i] for i in chunk_ids])
         return sorted(zip(chunk_ids, scores), key=lambda item: item[1], reverse=True)
 
     def _hit(self, chunk_id: str, score: float) -> Hit:
+        """Собирает результат поиска из чанка и его оценки."""
         chunk = self._chunks[chunk_id]
         return Hit(
             chunk_id=chunk.id,
@@ -159,10 +204,11 @@ class Retriever:
 
 
 def open_index(chroma_dir: str, chunks: list[Chunk], embed_model: str) -> Collection:
-    """Open the Chroma collection and refuse to use it if it was built from other schemes or model."""
+    """Открывает коллекцию Chroma и отказывается работать, если она собрана по другим схемам или модели."""
     if not Path(chroma_dir).exists():
         raise RuntimeError(f"no index in {chroma_dir}: run `python -m rag.index` first")
     collection = open_client(chroma_dir).get_collection(COLLECTION, embedding_function=None)
+    # Сверяем отпечаток из индекса с отпечатком текущих схем (см. index.fingerprint).
     stored = (collection.metadata or {}).get("fingerprint")
     if stored != fingerprint(chunks, embed_model):
         raise RuntimeError("index is stale (schemes or embedding model changed): run `python -m rag.index`")

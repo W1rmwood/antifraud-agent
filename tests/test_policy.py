@@ -1,6 +1,6 @@
 import pytest
 
-from agent.policy import decide, quote_is_said
+from agent.policy import decide, provoke_mode, quote_is_said
 from agent.prompts import Analysis
 
 CALLER = "Служба безопасности. Вам придёт смс, продиктуйте мне код из сообщения."
@@ -19,9 +19,6 @@ def analysis(
         confidence=confidence,
         hard_red_flags=["продиктуйте мне код из сообщения"] if flags is None else flags,
         evidence=[],
-        suggestion="Подождите, телефон разряжается.",
-        suggestion_kind="stall",
-        warning=None,
     )
 
 
@@ -86,3 +83,18 @@ def test_unsure_answer_keeps_declared_scheme() -> None:
 def test_switches_scheme_only_when_new_one_qualifies() -> None:
     decision = decide(analysis(), CALLER, CANDIDATES, threshold=0.6, current="safe-account", current_stage=1)
     assert decision.scheme_id == "bank-security-service"
+
+
+@pytest.mark.parametrize(
+    "stage_n, n_stages, provoke",
+    [
+        (None, 4, False),  # stage unknown: stay safe and keep baiting
+        (1, 4, False),
+        (2, 4, False),
+        (3, 4, True),  # second half of the scheme, close to the money
+        (4, 4, True),
+        (2, 3, True),
+    ],
+)
+def test_provoke_only_in_second_half(stage_n: int | None, n_stages: int, provoke: bool) -> None:
+    assert provoke_mode(stage_n, n_stages) is provoke

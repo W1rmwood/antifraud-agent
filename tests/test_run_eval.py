@@ -40,9 +40,6 @@ def turn(confidence: float, scheme_id: str | None = "gosuslugi", stage: int | No
         confidence=confidence,
         hard_red_flags=[FLAG],
         evidence=[],
-        suggestion="",
-        suggestion_kind="stall",
-        warning=None,
     )
     return Turn(seq=0, caller_text=f"Госуслуги, {FLAG}", candidates=["gosuslugi"], analysis=analysis, latency_s=1.0)
 

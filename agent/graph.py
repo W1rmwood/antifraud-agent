@@ -3,8 +3,12 @@
 На каждую реплику звонящего запускается небольшой граф LangGraph:
 
     retrieve (RAG: похожие этапы схем)
-      -> analyze (LLM: схема, этап, цитаты, подсказка в виде JSON)
-      -> act (правило решает; события уходят в UI; get_scheme при новой схеме)
+      -> analyze (LLM: схема, этап, цитаты требований — разведка, куда бить)
+      -> decide (код: объявлять ли схему; события схемы, этапа и предупреждения в UI)
+      -> reply (LLM: реплика, которая бесит мошенника; только для объявленной схемы)
+
+Каждая стрелка может закончить ход раньше: поиск ничего не нашёл — LLM не зовём;
+схема не объявлена — ответку не генерируем, и грубость не попадёт в обычный звонок.
 
 Инструменты вызываются в заранее известные моменты, а не по выбору LLM:
 lookup_number в начале звонка, get_scheme при объявлении схемы, save_case
@@ -25,8 +29,8 @@ from langgraph.graph.state import CompiledStateGraph
 from agent.config import Settings
 from agent.events import EventSink
 from agent.llm import LLM, LLMError
-from agent.policy import decide, quote_is_said
-from agent.prompts import Analysis, CallSummary, analysis_messages, summary_messages
+from agent.policy import decide, provoke_mode, quote_is_said
+from agent.prompts import TACTIC_KIND, Analysis, CallSummary, Reply, analysis_messages, reply_messages, summary_messages
 from agent.tools import ToolClient
 from contracts import AudioSource, CallCase, EventType, NumberInfo, Scheme, Speaker, Utterance
 from rag.retriever import Hit, Retriever
@@ -78,11 +82,8 @@ class CallState:
     scheme: Scheme | None = None  # объявленная схема
     stage_n: int | None = None  # текущий этап
     max_stage: int | None = None  # самый дальний этап за звонок; уходит в CallCase
-    flags: list[str] = field(default_factory=list)  # все подтверждённые красные флаги за звонок
-    # Последние отправленные подсказка и предупреждение, чтобы не слать одно и то же
-    # в UI на каждой реплике.
-    last_suggestion: str | None = None
-    last_warning: str | None = None
+    flags: list[str] = field(default_factory=list)  # подтверждённые требования мошенника после объявления схемы
+    suggestions: list[str] = field(default_factory=list)  # отправленные подсказки: модели — чтобы не повторялась
 
 
 class CallAgent:
@@ -164,17 +165,21 @@ class CallAgent:
     # --- граф ---
 
     def _build_graph(self) -> CompiledStateGraph:
-        """Собирает граф retrieve → analyze → act с ранними выходами."""
+        """Собирает граф retrieve → analyze → decide → reply с ранними выходами."""
         graph = StateGraph(TurnState)
         graph.add_node("retrieve", self._retrieve)
         graph.add_node("analyze", self._analyze)
-        graph.add_node("act", self._act)
+        graph.add_node("decide", self._decide)
+        graph.add_node("reply", self._reply)
         graph.add_edge(START, "retrieve")
         # Ранние выходы: если поиск ничего не нашёл, LLM не вызываем (нечего
-        # сравнивать — экономим секунды). Если LLM не ответила, act пропускаем.
+        # сравнивать — экономим секунды). Если LLM не ответила, decide пропускаем.
         graph.add_conditional_edges("retrieve", lambda s: "analyze" if s.get("hits") else END, ["analyze", END])
-        graph.add_conditional_edges("analyze", lambda s: "act" if "analysis" in s else END, ["act", END])
-        graph.add_edge("act", END)
+        graph.add_conditional_edges("analyze", lambda s: "decide" if "analysis" in s else END, ["decide", END])
+        # Ответку генерируем только при объявленной схеме: это и есть граница
+        # «никакой грубости в обычном звонке», зашитая в код, а не в промпт.
+        graph.add_conditional_edges("decide", lambda s: "reply" if self.state.scheme else END, ["reply", END])
+        graph.add_edge("reply", END)
         return graph.compile()
 
     async def _retrieve(self, state: TurnState) -> TurnState:
@@ -198,8 +203,8 @@ class CallAgent:
             log.error("analysis skipped for %s: %s", self.call_id, error)
             return {}
 
-    async def _act(self, state: TurnState) -> TurnState:
-        """Узел действий: применяет правило тревоги и отправляет события в UI."""
+    async def _decide(self, state: TurnState) -> TurnState:
+        """Узел решения: применяет правило тревоги и отправляет события схемы, этапа и предупреждения."""
         analysis, caller_text = state["analysis"], state["caller_text"]
         call = self.state
         candidates = {h.scheme_id for h in state["hits"]}
@@ -211,7 +216,6 @@ class CallAgent:
             current=call.scheme.id if call.scheme else None,
             current_stage=call.stage_n,
         )
-        call.flags += [f for f in decision.flags if f not in call.flags]
         if decision.scheme_id is None:
             # Схема не объявлена: подсказки и предупреждения не показываем,
             # чтобы не пугать человека на обычном звонке.
@@ -238,14 +242,34 @@ class CallAgent:
             )
 
         await self._update_stage(decision.stage_n)
-        if analysis.suggestion.strip() and analysis.suggestion != call.last_suggestion:
-            call.last_suggestion = analysis.suggestion
+        # Предупреждение собирает код из подтверждённой цитаты, а не пишет модель:
+        # так в нём не может оказаться того, чего мошенник не говорил.
+        new_flags = [f for f in decision.flags if f not in call.flags]
+        if new_flags:
+            call.flags += new_flags
+            quotes = "; ".join(f"«{f}»" for f in new_flags)
+            text = f"Мошенник требует: {quotes}. Ничего не называй и не переводи."
+            await self._sink.emit(EventType.warning, {"text": text})
+        return {}
+
+    async def _reply(self, state: TurnState) -> TurnState:
+        """Узел ответки: LLM пишет реплику, которая бесит мошенника, с учётом схемы и этапа."""
+        call, settings = self.state, self._deps.settings
+        assert call.scheme is not None
+        provoke = provoke_mode(call.stage_n, len(call.scheme.stages))
+        previous = call.suggestions[-settings.recent_replies :] if settings.recent_replies else []
+        messages = reply_messages(state["window"], call.scheme, call.stage_n, provoke, previous)
+        try:
+            reply = await self._deps.llm.generate(messages, Reply, temperature=settings.reply_temperature)
+        except LLMError as error:
+            log.error("reply skipped for %s: %s", self.call_id, error)
+            return {}
+        text = reply.text.strip()
+        if text and text not in call.suggestions:
+            call.suggestions.append(text)
             await self._sink.emit(
-                EventType.suggestion, {"text": analysis.suggestion, "kind": analysis.suggestion_kind}
+                EventType.suggestion, {"text": text, "kind": TACTIC_KIND[reply.tactic], "tactic": reply.tactic}
             )
-        if analysis.warning and analysis.warning != call.last_warning:
-            call.last_warning = analysis.warning
-            await self._sink.emit(EventType.warning, {"text": analysis.warning})
         return {}
 
     async def _update_stage(self, stage_n: int | None) -> None:

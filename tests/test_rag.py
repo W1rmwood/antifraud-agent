@@ -72,7 +72,7 @@ def test_rerank_reorders_fused_candidates(retriever: Retriever) -> None:
     query = QUERIES[0][0]
     hybrid = retriever.search(query, k=20, mode="hybrid")
     reranked = retriever.search(query, k=20, mode="hybrid_rerank")
-    assert [h.chunk_id for h in reranked] == [h.chunk_id for h in reversed(hybrid)]
+    assert [h.id for h in reranked] == [h.id for h in reversed(hybrid)]
 
 
 def test_bm25_without_overlap_returns_nothing(retriever: Retriever) -> None:

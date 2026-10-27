@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Protocol
 
 from chromadb.api.models.Collection import Collection
-from pydantic import BaseModel
 from rank_bm25 import BM25Okapi
 
 from agent.config import RetrievalMode, Settings
@@ -23,19 +22,14 @@ from rag.embeddings import Embedder, OllamaEmbedder
 from rag.index import COLLECTION, fingerprint, open_client
 
 
-class Hit(BaseModel):
-    """Один результат поиска: найденный этап и его оценка.
+class Hit(Chunk):
+    """Один результат поиска: найденный чанк-этап и его оценка.
 
     Шкала score зависит от режима: косинусная близость, оценка BM25,
     сумма RRF или оценка реранкера. Сравнивать score можно только внутри
     одной выдачи, не между режимами.
     """
 
-    chunk_id: str
-    scheme_id: str
-    stage_n: int
-    category: str
-    text: str
     score: float
 
 
@@ -155,7 +149,7 @@ class Retriever:
             scored = sorted(fused.items(), key=lambda item: item[1], reverse=True)
             if mode == "hybrid_rerank":
                 scored = self._rerank(query, [i for i, _ in scored[: self._candidates_k]])
-        return [self._hit(chunk_id, score) for chunk_id, score in scored[:k]]
+        return [Hit(**self._chunks[chunk_id].model_dump(), score=score) for chunk_id, score in scored[:k]]
 
     async def asearch(self, query: str, k: int = 5, mode: RetrievalMode | None = None) -> list[Hit]:
         """То же, что search, но в отдельном потоке: эмбеддинги и реранкер не блокируют event loop."""
@@ -189,18 +183,6 @@ class Retriever:
             raise RuntimeError("mode 'hybrid_rerank' needs a reranker")
         scores = self._reranker.score(query, [self._chunks[i] for i in chunk_ids])
         return sorted(zip(chunk_ids, scores), key=lambda item: item[1], reverse=True)
-
-    def _hit(self, chunk_id: str, score: float) -> Hit:
-        """Собирает результат поиска из чанка и его оценки."""
-        chunk = self._chunks[chunk_id]
-        return Hit(
-            chunk_id=chunk.id,
-            scheme_id=chunk.scheme_id,
-            stage_n=chunk.stage_n,
-            category=chunk.category,
-            text=chunk.text,
-            score=score,
-        )
 
 
 def open_index(chroma_dir: str, chunks: list[Chunk], embed_model: str) -> Collection:

@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     # 0 — модель всегда выбирает самый вероятный ответ: результат воспроизводим,
     # и eval можно повторить с теми же цифрами.
     llm_temperature: float = 0.0
+    # Для подсказок мошеннику наоборот нужна фантазия: при 0 модель на похожие
+    # реплики отвечала бы одним и тем же, а повтор не бесит.
+    reply_temperature: float = Field(default=0.8, ge=0.0, le=2.0)
     llm_retries: int = Field(default=2, ge=0)  # сколько раз переспросить после невалидного JSON
     llm_timeout_s: float = 120.0
 
@@ -54,6 +57,7 @@ class Settings(BaseSettings):
     # Агент
     window_size: int = Field(default=8, ge=1)  # сколько последних реплик видит LLM
     detect_threshold: float = Field(default=0.6, ge=0.0, le=1.0)  # порог уверенности для тревоги
+    recent_replies: int = Field(default=5, ge=0)  # сколько прошлых подсказок показать модели, чтобы не повторялась
     # inprocess — MCP-сервер в том же процессе (быстрее, один индекс в памяти);
     # stdio — отдельным процессом, как настоящий внешний MCP-сервер.
     mcp_transport: Literal["inprocess", "stdio"] = "inprocess"

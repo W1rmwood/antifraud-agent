@@ -9,15 +9,15 @@ import pytest
 from agent.config import Settings
 from agent.graph import AgentDeps
 from agent.llm import LLMError, generate_structured
-from agent.prompts import Analysis, CallSummary, analysis_messages
+from agent.prompts import BAIT_MODE, PROVOKE_MODE, Analysis, CallSummary, analysis_messages
 from agent.run import run_call
 from contracts import AgentEvent, AudioSource, CallCase, CallRequest, EventType, Speaker, Utterance
 from mcp_server.server import build_server
 from rag.chunks import load_schemes, scheme_chunks
 from rag.retriever import Hit, Retriever
 from tests.fakes import FakeListener, InMemoryStorage
-from tests.fakes.fake_llm import FakeLLM, no_fraud
-from tests.test_mock_events import PAYLOAD_KEYS
+from tests.fakes.fake_llm import DEFAULT_REPLY, FakeLLM, no_fraud
+from tests.test_mock_events import assert_payload_keys
 
 PHONE = "+79990000001"
 CALL_001 = "data/calls/001.txt"
@@ -38,10 +38,11 @@ def safe_account_rule(prompt: str) -> Analysis:
         confidence=0.9,
         hard_red_flags=[TRANSFER],
         evidence=["служба финансовой безопасности Центрального банка", "выдуманная цитата"],
-        suggestion="Подождите, я найду очки.",
-        suggestion_kind="stall",
-        warning="Просят перевести деньги на «резервный счёт». Ничего не переводите.",
     )
+
+
+def reply_prompts(llm: FakeLLM) -> list[str]:
+    return [p for p in llm.prompts if p.startswith("Развод:")]
 
 
 class Harness:
@@ -81,7 +82,8 @@ def seed_history(storage: InMemoryStorage) -> None:
 
 async def test_fraud_call_end_to_end(tmp_path: Path) -> None:
     summary = CallSummary(legend="сотрудник ЦБ", key_phrases=["резервный счёт"], summary="Мошенник от имени ЦБ.")
-    harness = Harness(tmp_path, FakeLLM(safe_account_rule, summary))
+    llm = FakeLLM(safe_account_rule, summary)
+    harness = Harness(tmp_path, llm)
     seed_history(harness.storage)
 
     case = await harness.run("call-001", FakeListener())
@@ -91,7 +93,7 @@ async def test_fraud_call_end_to_end(tmp_path: Path) -> None:
     # Event stream follows the contract the UI is built on.
     for event in events:
         if event.type not in (EventType.transcript, EventType.summary):
-            assert set(event.payload) == PAYLOAD_KEYS[event.type], event
+            assert_payload_keys(event)
     assert types[0] == EventType.call_started and types[-1] == EventType.call_ended
     assert types.count(EventType.transcript) == 12
 
@@ -113,7 +115,20 @@ async def test_fraud_call_end_to_end(tmp_path: Path) -> None:
 
     stages = [e.payload["stage_n"] for e in events if e.type == EventType.stage_changed]
     assert stages == [3, 2, 3]
-    assert [e.payload["kind"] for e in events if e.type == EventType.suggestion] == ["stall"]  # no repeats
+
+    # The warning quotes what the caller really demanded, once, after the scheme is declared.
+    warnings = [e.payload["text"] for e in events[events.index(detected[0]) :] if e.type == EventType.warning]
+    assert len(warnings) == 1 and TRANSFER in warnings[0]
+
+    # Replies to the scammer: generated only after declaration, creative temperature, no repeats.
+    suggestions = [e.payload for e in events if e.type == EventType.suggestion]
+    assert suggestions == [{"text": DEFAULT_REPLY.text, "kind": "provoke", "tactic": "mockery"}]
+    replies = reply_prompts(llm)
+    temperatures = {t for p, t in zip(llm.prompts, llm.temperatures, strict=True) if p in replies}
+    assert replies and temperatures == {harness.settings.reply_temperature}
+    # Stage 3 of 4 is close to the money, stage 2 is not: the mode escalates with the stage.
+    assert PROVOKE_MODE in replies[0] and any(BAIT_MODE in p for p in replies)
+    assert "Уже говорили" in replies[-1] and DEFAULT_REPLY.text in replies[-1]
 
     # The case is saved through MCP and matches the summary event.
     assert case.scheme_id == "safe-account" and case.max_stage == 3
@@ -136,6 +151,7 @@ async def test_ordinary_call_raises_no_alarm(tmp_path: Path) -> None:
 
     types = {e.type for e in harness.events()}
     assert not types & {EventType.scheme_detected, EventType.suggestion, EventType.warning}
+    assert not reply_prompts(harness.deps.llm)  # type: ignore[arg-type]  # no rudeness on a normal call
     assert "lookup_number" not in str(harness.events())
     assert case.scheme_id is None and case.max_stage is None
 
@@ -151,6 +167,16 @@ async def test_dead_llm_does_not_break_the_call(tmp_path: Path) -> None:
     assert case.scheme_id is None
     assert "Схема не найдена" in case.summary
     assert harness.storage.list_recent_cases()[0].call_id == "call-dead"
+
+
+async def test_dead_reply_keeps_detection(tmp_path: Path) -> None:
+    harness = Harness(tmp_path, FakeLLM(safe_account_rule, summary=None, reply=None))
+
+    case = await harness.run("call-noreply", FakeListener())
+
+    types = {e.type for e in harness.events()}
+    assert case.scheme_id == "safe-account"
+    assert EventType.scheme_detected in types and EventType.suggestion not in types
 
 
 async def test_impossible_stage_is_ignored(tmp_path: Path) -> None:
@@ -178,7 +204,7 @@ async def test_user_utterances_do_not_trigger_analysis(tmp_path: Path) -> None:
 
 
 def test_analysis_prompt_contains_candidates_and_dialogue() -> None:
-    hit = Hit(chunk_id="gosuslugi#2", scheme_id="gosuslugi", stage_n=2, category="gosuslugi", text="Выманивание кода", score=1.0)
+    hit = Hit(id="gosuslugi#2", scheme_id="gosuslugi", stage_n=2, category="gosuslugi", text="Выманивание кода", score=1.0)
     window = [
         Utterance(call_id="c", seq=0, speaker=Speaker.caller, text="Продиктуйте код", t_start=0, t_end=1),
         Utterance(call_id="c", seq=1, speaker=Speaker.user, text="Зачем?", t_start=1, t_end=2),

@@ -8,6 +8,7 @@
 
 import logging
 from collections.abc import Awaitable, Callable
+from functools import partial
 from typing import Any, Protocol
 
 import httpx  # транспорт клиента ollama; его таймауты ollama не оборачивает в свои ошибки
@@ -27,9 +28,14 @@ class LLMError(Exception):
 
 
 class LLM(Protocol):
-    """Всё, что по сообщениям возвращает ответ в виде заданной Pydantic-модели."""
+    """Всё, что по сообщениям возвращает ответ в виде заданной Pydantic-модели.
 
-    async def generate[T: BaseModel](self, messages: Messages, schema: type[T]) -> T: ...
+    `temperature` — разброс ответов на этот вызов; None — значение по умолчанию.
+    """
+
+    async def generate[T: BaseModel](
+        self, messages: Messages, schema: type[T], temperature: float | None = None
+    ) -> T: ...
 
 
 async def generate_structured[T: BaseModel](
@@ -66,14 +72,17 @@ class OllamaLLM:
     ) -> None:
         self.model = model
         self._client = ollama.AsyncClient(host=host, timeout=timeout_s)
-        self._options = {"temperature": temperature}
+        self._temperature = temperature
         self._retries = retries
 
-    async def generate[T: BaseModel](self, messages: Messages, schema: type[T]) -> T:
+    async def generate[T: BaseModel](
+        self, messages: Messages, schema: type[T], temperature: float | None = None
+    ) -> T:
         """Ответ модели в виде `schema`, с повтором при невалидном JSON."""
-        return await generate_structured(self._chat, messages, schema, self._retries)
+        options = {"temperature": self._temperature if temperature is None else temperature}
+        return await generate_structured(partial(self._chat, options=options), messages, schema, self._retries)
 
-    async def _chat(self, messages: Messages, json_schema: dict[str, Any]) -> str:
+    async def _chat(self, messages: Messages, json_schema: dict[str, Any], options: dict[str, float]) -> str:
         """Один запрос к Ollama. Сетевые ошибки превращаются в LLMError, чтобы агент обрабатывал один тип."""
         try:
             response = await self._client.chat(
@@ -83,7 +92,7 @@ class OllamaLLM:
                 # Режим рассуждений qwen3 добавляет секунды задержки на каждую реплику,
                 # а подсказка нужна, пока мошенник ещё на линии.
                 think=False,
-                options=self._options,
+                options=options,
             )
         except (ollama.ResponseError, ConnectionError, httpx.TimeoutException) as error:
             raise LLMError(f"Ollama call failed: {error}") from error

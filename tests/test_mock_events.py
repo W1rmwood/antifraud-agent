@@ -4,7 +4,10 @@ from pathlib import Path
 
 import pytest
 
+from typing import get_args
+
 from contracts import AgentEvent, CallCase, EventType, NumberInfo, Scheme, Utterance
+from contracts.models import SuggestionKind
 
 EXAMPLE = Path("data/mock_events/example.jsonl")
 
@@ -19,6 +22,13 @@ PAYLOAD_KEYS: dict[EventType, set[str]] = {
     EventType.tool_result: {"tool", "ok", "result"},
     EventType.call_ended: set(),
 }
+# Keys added later with backward compatibility: they may be missing in older logs.
+OPTIONAL_KEYS: dict[EventType, set[str]] = {EventType.suggestion: {"tactic"}}
+
+
+def assert_payload_keys(event: AgentEvent) -> None:
+    keys, required = set(event.payload), PAYLOAD_KEYS[event.type]
+    assert required <= keys <= required | OPTIONAL_KEYS.get(event.type, set()), event
 
 
 @pytest.fixture(scope="module")
@@ -45,9 +55,9 @@ def test_payloads_match_contract(events: list[AgentEvent]) -> None:
         elif e.type == EventType.summary:
             CallCase.model_validate(e.payload)
         else:
-            assert set(e.payload) == PAYLOAD_KEYS[e.type], e
+            assert_payload_keys(e)
         if e.type == EventType.suggestion:
-            assert e.payload["kind"] in {"stall", "question"}
+            assert e.payload["kind"] in get_args(SuggestionKind)
 
 
 def test_transcript_seq_is_continuous(events: list[AgentEvent]) -> None:

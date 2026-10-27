@@ -147,10 +147,27 @@ class EventType(StrEnum):
     call_ended = "call_ended"
 
 
+# Вид подсказки. stall — тянуть время, подыгрывая; question — уточняющий вопрос;
+# provoke — бесить мошенника (абсурд, перехват роли, издёвка, мат).
+SuggestionKind = Literal["stall", "question", "provoke"]
+
+
 class AgentEvent(Contract):
     """Один шаг агента. Уходит в UI и пишется в лог data/runs/<call_id>.jsonl.
 
-    Форма payload для каждого типа события описана в CLAUDE.md.
+    Что лежит в payload каждого типа:
+
+    - call_started: {phone, source}
+    - transcript: Utterance
+    - scheme_detected: {scheme_id, scheme_name, confidence, evidence: [str]}
+    - stage_changed: {scheme_id, stage_n, stage_name, next_move}
+    - suggestion: {text, kind: SuggestionKind, tactic?} — tactic есть только у
+      подсказок агента (см. agent.prompts.TACTICS), в старых логах его нет
+    - warning: {text}
+    - tool_call: {tool, args}
+    - tool_result: {tool, ok, result}
+    - summary: CallCase
+    - call_ended: {}
     """
 
     call_id: NonEmptyStr

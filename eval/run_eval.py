@@ -81,7 +81,7 @@ def eval_retrieval(retriever: Retriever, cases: list[EvalCase], mode: RetrievalM
             hit1 += rank == 1
             hitk += 1
             rr += 1 / rank
-        stage_hit += f"{case.expected_scheme}#{case.expected_stage}" in {h.chunk_id for h in hits}
+        stage_hit += f"{case.expected_scheme}#{case.expected_stage}" in {h.id for h in hits}
     n = len(fraud)
     return RetrievalRow(mode, hit1 / n, hitk / n, rr / n, stage_hit / n, 1000 * statistics.median(latencies))
 

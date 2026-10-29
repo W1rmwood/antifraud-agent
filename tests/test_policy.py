@@ -1,7 +1,10 @@
+from pathlib import Path
+
 import pytest
 
-from agent.policy import decide, provoke_mode, quote_is_said
+from agent.policy import decide, hangup_text, provoke_mode, quote_is_said
 from agent.prompts import Analysis
+from contracts import Scheme
 
 CALLER = "Служба безопасности. Вам придёт смс, продиктуйте мне код из сообщения."
 CANDIDATES = {"bank-security-service", "safe-account"}
@@ -80,9 +83,67 @@ def test_unsure_answer_keeps_declared_scheme() -> None:
     assert (decision.scheme_id, decision.stage_n) == ("safe-account", 2)
 
 
-def test_switches_scheme_only_when_new_one_qualifies() -> None:
-    decision = decide(analysis(), CALLER, CANDIDATES, threshold=0.6, current="safe-account", current_stage=1)
+def test_switches_scheme_when_clearly_more_confident() -> None:
+    decision = decide(
+        analysis(confidence=0.9), CALLER, CANDIDATES, threshold=0.6,
+        current="safe-account", current_stage=1, current_confidence=0.7,
+    )
     assert decision.scheme_id == "bank-security-service"
+    assert decision.challenger is None
+
+
+def test_does_not_switch_on_one_win_within_margin() -> None:
+    decision = decide(
+        analysis(confidence=0.95), CALLER, CANDIDATES, threshold=0.6,
+        current="safe-account", current_stage=1, current_confidence=0.9,
+    )
+    assert (decision.scheme_id, decision.stage_n) == ("safe-account", 1)
+    assert decision.challenger == "bank-security-service"
+    assert decision.flags == ["продиктуйте мне код из сообщения"]  # предупреждение всё равно будет
+
+
+def test_switches_on_second_consecutive_win() -> None:
+    decision = decide(
+        analysis(confidence=0.95), CALLER, CANDIDATES, threshold=0.6,
+        current="safe-account", current_stage=1, current_confidence=0.9,
+        challenger="bank-security-service",
+    )
+    assert (decision.scheme_id, decision.stage_n) == ("bank-security-service", 3)
+    assert decision.challenger is None
+
+
+def test_different_challenger_does_not_count_as_second_win() -> None:
+    decision = decide(
+        analysis(confidence=0.95), CALLER, CANDIDATES, threshold=0.6,
+        current="safe-account", current_stage=1, current_confidence=0.9,
+        challenger="gosuslugi",
+    )
+    assert decision.scheme_id == "safe-account"
+    assert decision.challenger == "bank-security-service"
+
+
+def test_weak_answer_breaks_challenger_streak() -> None:
+    decision = decide(
+        analysis(confidence=0.3), CALLER, CANDIDATES, threshold=0.6,
+        current="safe-account", current_stage=1, current_confidence=0.9,
+        challenger="bank-security-service",
+    )
+    assert decision.scheme_id == "safe-account"
+    assert decision.challenger is None
+
+
+@pytest.mark.parametrize(
+    "category, phrase",
+    [
+        ("bank", "по номеру с обратной стороны карты"),
+        ("relative", "на его обычный номер"),
+        ("other", "по номеру с официального сайта"),
+    ],
+)
+def test_hangup_text_depends_on_category(category: str, phrase: str) -> None:
+    scheme = Scheme.model_validate_json(Path("data/schemes/safe-account.json").read_text(encoding="utf-8"))
+    text = hangup_text(scheme.model_copy(update={"category": category}))
+    assert text.startswith("Положите трубку") and phrase in text
 
 
 @pytest.mark.parametrize(

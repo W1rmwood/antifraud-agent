@@ -1,14 +1,21 @@
 """Агент одного звонка.
 
-На каждую реплику звонящего запускается небольшой граф LangGraph:
+Ход агента — разбор окна последних реплик небольшим графом LangGraph:
 
     retrieve (RAG: похожие этапы схем)
       -> analyze (LLM: схема, этап, цитаты требований — разведка, куда бить)
       -> decide (код: объявлять ли схему; события схемы, этапа и предупреждения в UI)
-      -> reply (LLM: реплика, которая бесит мошенника; только для объявленной схемы)
 
 Каждая стрелка может закончить ход раньше: поиск ничего не нашёл — LLM не зовём;
-схема не объявлена — ответку не генерируем, и грубость не попадёт в обычный звонок.
+LLM не ответила — решение не принимаем.
+
+Реплику, которая бесит мошенника, LLM пишет уже после хода, фоновой задачей
+и только для объявленной схемы: грубость не попадёт в обычный звонок, а разбор
+(схема, этап, предупреждение, подсказка «положить трубку») не ждёт ещё ~8 с генерации.
+Одновременно идёт не больше одной такой генерации.
+
+Запись реплики (record) и разбор (analyze) разделены: run_call показывает
+фразу сразу, а разбирает пачкой, когда модель освободится.
 
 Инструменты вызываются в заранее известные моменты, а не по выбору LLM:
 lookup_number в начале звонка, get_scheme при объявлении схемы, save_case
@@ -16,6 +23,7 @@ lookup_number в начале звонка, get_scheme при объявлени
 непредсказуемее, а здесь правильный момент для каждого инструмента известен заранее.
 """
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -28,8 +36,9 @@ from langgraph.graph.state import CompiledStateGraph
 
 from agent.config import Settings
 from agent.events import EventSink
-from agent.llm import LLM, LLMError
-from agent.policy import decide, provoke_mode, quote_is_said
+from agent.llm import LLM, LLMError, Messages
+from agent.policy import HANGUP_DEFAULT, decide, hangup_text, provoke_mode, quote_is_said
+from agent.rules import instant_flags, warning_text
 from agent.prompts import TACTIC_KIND, Analysis, CallSummary, Reply, analysis_messages, reply_messages, summary_messages
 from agent.tools import ToolClient
 from contracts import AudioSource, CallCase, EventType, NumberInfo, Scheme, Speaker, Utterance
@@ -39,7 +48,7 @@ log = logging.getLogger(__name__)
 
 
 class TurnState(TypedDict, total=False):
-    """Состояние графа на один ход (одну реплику).
+    """Состояние графа на один ход (разбор одного окна реплик).
 
     Каждый узел возвращает только те ключи, которые меняет, а LangGraph
     сливает их в общее состояние. total=False — потому что ключи появляются
@@ -63,13 +72,16 @@ class AgentDeps:
 
 @dataclass(frozen=True)
 class Turn:
-    """След одной разобранной реплики. Нужен eval: задержка и подбор порога без повторного запуска LLM."""
+    """След одного хода разбора. Нужен eval: задержка и подбор порога без повторного запуска LLM."""
 
-    seq: int
+    seq: int  # номер последней реплики в окне хода
     caller_text: str
     candidates: list[str]
     analysis: Analysis | None  # None — LLM не ответила или поиск ничего не нашёл
-    latency_s: float
+    latency_s: float  # время разбора, без фоновой генерации реплики модели
+    # Сколько новых реплик накопилось к ходу: больше 1 — модель не успевала
+    # за разговором, и run_call разобрал их одной пачкой.
+    batch_size: int = 1
 
 
 @dataclass
@@ -80,9 +92,14 @@ class CallState:
     phone: str | None = None
     transcript: list[Utterance] = field(default_factory=list)
     scheme: Scheme | None = None  # объявленная схема
+    confidence: float | None = None  # уверенность модели в объявленной схеме на последнем её ходу
+    challenger: str | None = None  # схема, которая обошла объявленную на прошлом ходу
     stage_n: int | None = None  # текущий этап
     max_stage: int | None = None  # самый дальний этап за звонок; уходит в CallCase
     flags: list[str] = field(default_factory=list)  # подтверждённые требования мошенника после объявления схемы
+    offer_hangup: bool = False  # на этом ходу показать подсказку «закончить разговор»
+    rule_quotes: list[str] = field(default_factory=list)  # фразы, на которые уже сработали правила без LLM
+    rule_hangup_sent: bool = False  # общая подсказка hangup от правил уже показана
     suggestions: list[str] = field(default_factory=list)  # отправленные подсказки: модели — чтобы не повторялась
 
 
@@ -90,6 +107,8 @@ class CallAgent:
     """Ведёт один звонок от начала до отчёта.
 
     Порядок вызовов: start() → on_utterance() на каждую фразу → finish().
+    В живом звонке run_call вместо on_utterance зовёт record() на каждую фразу
+    и analyze() на пачку фраз, когда модель свободна.
     """
 
     def __init__(self, call_id: str, deps: AgentDeps, sink: EventSink, tools: ToolClient) -> None:
@@ -100,6 +119,7 @@ class CallAgent:
         self._sink = sink
         self._tools = tools
         self._schemes: dict[str, Scheme] = {}  # кэш схем, уже полученных через get_scheme
+        self._reply_task: asyncio.Task[None] | None = None  # фоновая генерация реплики модели
         self._graph = self._build_graph()
 
     async def start(self, source: AudioSource, phone: str | None = None) -> None:
@@ -122,28 +142,97 @@ class CallAgent:
             )
 
     async def on_utterance(self, utterance: Utterance) -> None:
-        """Обрабатывает одну фразу: показывает её в UI и, если говорит звонящий, запускает граф."""
-        self.state.transcript.append(utterance)
-        await self._sink.emit(EventType.transcript, utterance.model_dump(mode="json"))
+        """Пошаговый режим: показывает фразу и, если говорит не абонент, разбирает окно.
+
+        Ждёт и реплику модели, так что после вызова ход закончен целиком. Так
+        работают eval (фрагмент за фрагментом, без гонок) и тесты; в живом
+        звонке run_call зовёт record и analyze по отдельности.
+        """
+        await self.record(utterance)
         if utterance.speaker == Speaker.user:
             # Агент реагирует на звонящего. Слова абонента при этом остаются
             # в окне: модели нужен контекст, на что именно отвечает мошенник.
             return
+        await self.analyze()
+        await self.wait_reply()
+
+    async def record(self, utterance: Utterance) -> None:
+        """Добавляет фразу в транскрипт и сразу показывает её в UI, не дожидаясь модели.
+
+        Слова звонящего здесь же проверяются правилами без LLM (agent.rules): красная плашка
+        появляется через доли секунды после фразы, а не после разбора моделью (ТЗ:
+        «предупреждения не зависят от LLM»).
+        """
+        call = self.state
+        call.transcript.append(utterance)
+        await self._sink.emit(EventType.transcript, utterance.model_dump(mode="json"))
+        if utterance.speaker == Speaker.user:
+            return
+        hits = [h for h in instant_flags(utterance.text) if h.quote not in call.rule_quotes]
+        if not hits:
+            return
+        call.rule_quotes += [h.quote for h in hits]
+        await self._sink.emit(EventType.warning, {"text": warning_text(hits)})
+        if not call.rule_hangup_sent and call.scheme is None:
+            # Схема ещё не определена, но звонящий уже чего-то требует: безопасный выход
+            # показываем сразу, общим текстом. После объявления схемы его заменит текст по её категории.
+            call.rule_hangup_sent = True
+            await self._sink.emit(EventType.suggestion, {"text": HANGUP_DEFAULT, "kind": "hangup"})
+
+    async def analyze(self, batch_size: int = 1) -> Turn:
+        """Один ход: граф по окну последних реплик, подсказка hangup и запуск фоновой реплики модели.
+
+        `batch_size` — сколько новых реплик пришло с прошлого хода; пишется в Turn.
+        """
         window = self.state.transcript[-self._deps.settings.window_size :]
         started = time.perf_counter()
         result = await self._graph.ainvoke({"window": window})
-        self.turns.append(
-            Turn(
-                seq=utterance.seq,
-                caller_text=result.get("caller_text", ""),
-                candidates=[h.scheme_id for h in result.get("hits", [])],
-                analysis=result.get("analysis"),
-                latency_s=time.perf_counter() - started,
+        latency = time.perf_counter() - started
+        if self.state.offer_hangup and self.state.scheme is not None:
+            # Сразу после разбора, не дожидаясь реплики модели: безопасный выход
+            # нужен человеку первым, а реплика придёт через несколько секунд.
+            # Текст пишет код: модель не может «забыть» предложить положить трубку.
+            self.state.offer_hangup = False
+            await self._sink.emit(
+                EventType.suggestion, {"text": hangup_text(self.state.scheme), "kind": "hangup"}
             )
+        if "analysis" in result and self.state.scheme is not None:
+            # Ответку генерируем только при объявленной схеме: это и есть граница
+            # «никакой грубости в обычном звонке», зашитая в код, а не в промпт.
+            self._start_reply(window)
+        turn = Turn(
+            seq=window[-1].seq,
+            caller_text=result.get("caller_text", ""),
+            candidates=[h.scheme_id for h in result.get("hits", [])],
+            analysis=result.get("analysis"),
+            latency_s=latency,
+            batch_size=batch_size,
         )
+        self.turns.append(turn)
+        return turn
+
+    async def wait_reply(self, timeout_s: float | None = None) -> None:
+        """Дожидается фоновой реплики модели, если она ещё пишется.
+
+        По истечении `timeout_s` генерация отменяется: отчёт о звонке важнее
+        запоздавшей подсказки. None — ждать сколько потребуется.
+        """
+        task = self._reply_task
+        if task is None:
+            return
+        try:
+            # wait_for сам отменяет задачу, если время вышло.
+            await asyncio.wait_for(task, timeout_s)
+        except TimeoutError:
+            log.warning("reply for %s cancelled after %.0f s", self.call_id, timeout_s)
 
     async def finish(self) -> CallCase:
-        """Конец звонка: отчёт, сохранение через save_case и событие call_ended."""
+        """Конец звонка: дожидается реплики модели, затем отчёт, save_case и событие call_ended."""
+        try:
+            await self.wait_reply(self._deps.settings.reply_wait_s)
+        except Exception:
+            # Сбой подсказки не должен помешать сохранить кейс.
+            log.exception("reply failed for %s", self.call_id)
         summary = await self._summarize()
         case = CallCase(
             call_id=self.call_id,
@@ -165,21 +254,17 @@ class CallAgent:
     # --- граф ---
 
     def _build_graph(self) -> CompiledStateGraph:
-        """Собирает граф retrieve → analyze → decide → reply с ранними выходами."""
+        """Собирает граф retrieve → analyze → decide с ранними выходами."""
         graph = StateGraph(TurnState)
         graph.add_node("retrieve", self._retrieve)
         graph.add_node("analyze", self._analyze)
         graph.add_node("decide", self._decide)
-        graph.add_node("reply", self._reply)
         graph.add_edge(START, "retrieve")
         # Ранние выходы: если поиск ничего не нашёл, LLM не вызываем (нечего
         # сравнивать — экономим секунды). Если LLM не ответила, decide пропускаем.
         graph.add_conditional_edges("retrieve", lambda s: "analyze" if s.get("hits") else END, ["analyze", END])
         graph.add_conditional_edges("analyze", lambda s: "decide" if "analysis" in s else END, ["decide", END])
-        # Ответку генерируем только при объявленной схеме: это и есть граница
-        # «никакой грубости в обычном звонке», зашитая в код, а не в промпт.
-        graph.add_conditional_edges("decide", lambda s: "reply" if self.state.scheme else END, ["reply", END])
-        graph.add_edge("reply", END)
+        graph.add_edge("decide", END)
         return graph.compile()
 
     async def _retrieve(self, state: TurnState) -> TurnState:
@@ -215,11 +300,19 @@ class CallAgent:
             self._deps.settings.detect_threshold,
             current=call.scheme.id if call.scheme else None,
             current_stage=call.stage_n,
+            current_confidence=call.confidence,
+            challenger=call.challenger,
+            margin=self._deps.settings.switch_margin,
         )
+        call.challenger = decision.challenger
         if decision.scheme_id is None:
             # Схема не объявлена: подсказки и предупреждения не показываем,
             # чтобы не пугать человека на обычном звонке.
             return {}
+        if analysis.scheme_id == decision.scheme_id:
+            # Запоминаем уверенность, только когда модель выбрала объявленную схему:
+            # с ней сравнивается следующий претендент.
+            call.confidence = analysis.confidence
 
         if call.scheme is None or decision.scheme_id != call.scheme.id:
             # Новая схема (впервые или сменилась): берём её целиком через MCP.
@@ -227,6 +320,7 @@ class CallAgent:
             if scheme is None:
                 return {}
             call.scheme, call.stage_n = scheme, None
+            call.offer_hangup = True
             # В доказательства идут подтверждённые флаги и только те цитаты
             # модели, которые реально прозвучали. dict.fromkeys убирает
             # повторы с сохранением порядка.
@@ -238,39 +332,65 @@ class CallAgent:
                     "scheme_name": scheme.name,
                     "confidence": analysis.confidence,
                     "evidence": list(dict.fromkeys(evidence)),
+                    # Все этапы схемы: UI рисует прогресс по событиям, не читая data/schemes/.
+                    "stages": [{"n": s.n, "name": s.name} for s in scheme.stages],
                 },
             )
 
         await self._update_stage(decision.stage_n)
         # Предупреждение собирает код из подтверждённой цитаты, а не пишет модель:
         # так в нём не может оказаться того, чего мошенник не говорил.
-        new_flags = [f for f in decision.flags if f not in call.flags]
+        # Требование, о котором уже предупредили правила без LLM, второй плашкой не дублируем.
+        new_flags = [
+            f for f in decision.flags
+            if f not in call.flags and not any(quote_is_said(f, q) for q in call.rule_quotes)
+        ]
         if new_flags:
             call.flags += new_flags
+            # Мошенник выдвинул новое требование (код, перевод, наличные) — снова напоминаем про выход.
+            call.offer_hangup = True
             quotes = "; ".join(f"«{f}»" for f in new_flags)
             text = f"Мошенник требует: {quotes}. Ничего не называй и не переводи."
             await self._sink.emit(EventType.warning, {"text": text})
         return {}
 
-    async def _reply(self, state: TurnState) -> TurnState:
-        """Узел ответки: LLM пишет реплику, которая бесит мошенника, с учётом схемы и этапа."""
+    def _start_reply(self, window: list[Utterance]) -> None:
+        """Запускает фоновую генерацию реплики модели, если предыдущая уже закончилась."""
+        previous_task = self._reply_task
+        if previous_task is not None:
+            if not previous_task.done():
+                # Single-flight: две генерации разом только замедлили бы обе
+                # и разбор вместе с ними. Следующий ход даст новую попытку.
+                log.info("reply for %s skipped: previous one is still generating", self.call_id)
+                return
+            previous_task.result()  # поднимает ошибку прошлой генерации, если она упала не на LLM
         call, settings = self.state, self._deps.settings
         assert call.scheme is not None
+        # Промпт собираем сейчас, по окну и этапу этого хода: пока задача ждёт
+        # своей очереди, разбор следующей пачки может их поменять.
         provoke = provoke_mode(call.stage_n, len(call.scheme.stages))
         previous = call.suggestions[-settings.recent_replies :] if settings.recent_replies else []
-        messages = reply_messages(state["window"], call.scheme, call.stage_n, provoke, previous)
+        messages = reply_messages(window, call.scheme, call.stage_n, provoke, previous)
+        self._reply_task = asyncio.create_task(self._reply(call.scheme, messages))
+
+    async def _reply(self, scheme: Scheme, messages: Messages) -> None:
+        """Фоновая ответка: LLM пишет реплику, которая бесит мошенника, с учётом схемы и этапа."""
+        call, settings = self.state, self._deps.settings
         try:
             reply = await self._deps.llm.generate(messages, Reply, temperature=settings.reply_temperature)
         except LLMError as error:
             log.error("reply skipped for %s: %s", self.call_id, error)
-            return {}
+            return
+        if call.scheme is not scheme:
+            # Пока модель писала, разбор сменил схему: реплика про старую легенду уже не к месту.
+            log.info("reply for %s dropped: scheme changed", self.call_id)
+            return
         text = reply.text.strip()
         if text and text not in call.suggestions:
             call.suggestions.append(text)
             await self._sink.emit(
                 EventType.suggestion, {"text": text, "kind": TACTIC_KIND[reply.tactic], "tactic": reply.tactic}
             )
-        return {}
 
     async def _update_stage(self, stage_n: int | None) -> None:
         """Переключает этап и шлёт stage_changed, если этап действительно поменялся."""

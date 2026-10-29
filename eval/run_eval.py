@@ -197,10 +197,18 @@ def replay(run: CaseRun, threshold: float, schemes: dict[str, Scheme]) -> tuple[
     scheme_id: str | None = None
     stage: int | None = None
     max_stage: int | None = None
+    confidence: float | None = None
+    challenger: str | None = None
     for turn in run.turns:
         if turn.analysis is None:
             continue
-        decision = decide(turn.analysis, turn.caller_text, set(turn.candidates), threshold, scheme_id, stage)
+        decision = decide(
+            turn.analysis, turn.caller_text, set(turn.candidates), threshold,
+            scheme_id, stage, confidence, challenger,
+        )
+        challenger = decision.challenger
+        if decision.scheme_id is not None and turn.analysis.scheme_id == decision.scheme_id:
+            confidence = turn.analysis.confidence  # как в CallAgent._decide
         if decision.scheme_id != scheme_id:
             scheme_id, stage = decision.scheme_id, None
         # Та же проверка номера этапа, что в CallAgent._update_stage.

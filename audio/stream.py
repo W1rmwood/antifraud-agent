@@ -9,11 +9,11 @@ import asyncio
 import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 
 from audio import asr
-from audio.capture import SAMPLE_RATE, load_channels
-from audio.vad import split_speech
+from audio.capture import SAMPLE_RATE, load_channels, open_capture
+from audio.vad import StreamSegmenter, split_speech
 from contracts.models import AudioSource, Speaker, Utterance
 
 # Один поток: модель Whisper не рассчитана на параллельные вызовы, а CPU и так занят целиком.
@@ -22,17 +22,25 @@ _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr")
 _TRANSCRIPT_LINE = re.compile(r"^\s*(caller|user|unknown)\s*:\s*(.+?)\s*$", re.IGNORECASE)
 
 
+BlockSource = Callable[[AudioSource], AsyncIterator]  # фабрика асинхронного потока блоков float32 16 кГц
+
+
 async def listen(source: AudioSource, call_id: str, *, realtime: bool = False,
-                 model_size: str | None = None) -> AsyncIterator[Utterance]:
+                 model_size: str | None = None,
+                 blocks: BlockSource | None = None) -> AsyncIterator[Utterance]:
     """Выдаёт реплики звонка в порядке времени.
 
     kind="file": .wav/.flac/.ogg — VAD + Whisper; стерео: левый канал caller, правый user;
     моно: unknown. Файл .txt — эталонный транскрипт («caller: текст» построчно), без распознавания.
     realtime=True — реплика выдаётся не раньше, чем фраза «прозвучала» бы в живом звонке
     (для демо и замера задержки); по умолчанию файл обрабатывается так быстро, как получится.
+    kind="mic"/"loopback": живой звук, один канал → speaker = unknown (см. _listen_live);
+    blocks — подменяемый источник блоков (в тестах вместо микрофона).
     """
-    if source.kind != "file":
-        raise NotImplementedError(f"режим {source.kind!r} — опция после КТ3, пока только file")
+    if source.kind in ("mic", "loopback"):
+        async for u in _listen_live(source, call_id, model_size, blocks or open_capture):
+            yield u
+        return
     if not source.path:
         raise ValueError("для kind='file' нужен path")
     path = Path(source.path)
@@ -89,3 +97,63 @@ async def _listen_transcript(path: Path, call_id: str, realtime: bool) -> AsyncI
         yield Utterance(call_id=call_id, seq=seq, speaker=speaker, text=text,
                         t_start=round(t, 2), t_end=round(t + duration, 2))
         t += duration + 0.5
+
+
+async def _listen_live(source: AudioSource, call_id: str, model_size: str | None,
+                       blocks: BlockSource) -> AsyncIterator[Utterance]:
+    """Живой звук: блоки → VAD (потоково) → Whisper в потоке → Utterance.
+
+    Нарезка идёт в отдельной задаче, чтобы пока Whisper распознаёт предыдущую фразу, звук не терялся
+    и следующая фраза уже накапливалась. t_start/t_end — секунды от начала захвата.
+    """
+    loop = asyncio.get_running_loop()
+    size = model_size or asr.DEFAULT_MODEL
+    phrases: asyncio.Queue = asyncio.Queue()
+    stream = blocks(source)
+
+    async def segment() -> None:
+        try:
+            # Сначала грузим Whisper (в том же потоке), пока говорящий ещё не закончил первую фразу:
+            # иначе загрузка модели съест задержку первой реплики. Блоки тем временем копятся в очереди захвата.
+            if not _fake_asr_loaded(size):
+                await loop.run_in_executor(_executor, asr.load_model, size)
+            segmenter = await loop.run_in_executor(_executor, StreamSegmenter)
+            async for block in stream:
+                for phrase in segmenter.feed(block):
+                    phrases.put_nowait(phrase)
+            for phrase in segmenter.flush():
+                phrases.put_nowait(phrase)
+            phrases.put_nowait(None)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:  # ошибку устройства отдаём потребителю, а не теряем в задаче
+            phrases.put_nowait(e)
+
+    task = asyncio.create_task(segment())
+    seq = 0
+    try:
+        while True:
+            item = await phrases.get()
+            if item is None:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            start, end, audio = item
+            text = await loop.run_in_executor(_executor, asr.transcribe, audio, size)
+            if not text:
+                continue
+            yield Utterance(call_id=call_id, seq=seq, speaker=Speaker.unknown, text=text,
+                            t_start=round(start, 2), t_end=round(end, 2))
+            seq += 1
+    finally:
+        # отмена, выход потребителя из async for или ошибка: останавливаем нарезку и закрываем захват
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        aclose = getattr(stream, "aclose", None)
+        if aclose:
+            await aclose()
+
+
+def _fake_asr_loaded(size: str) -> bool:
+    """Тесты подменяют asr.transcribe — тогда настоящую модель грузить незачем."""
+    return getattr(asr.transcribe, "__module__", "") != asr.__name__

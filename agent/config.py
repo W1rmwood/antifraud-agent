@@ -34,6 +34,16 @@ class Settings(BaseSettings):
     reply_temperature: float = Field(default=0.8, ge=0.0, le=2.0)
     llm_retries: int = Field(default=2, ge=0)  # сколько раз переспросить после невалидного JSON
     llm_timeout_s: float = 120.0
+    # Сколько Ollama держит модель в памяти после вызова. Загрузка qwen3:8b занимает
+    # ~5 с, а реплики идут каждые несколько секунд, поэтому выгружать её между ходами нельзя.
+    llm_keep_alive: str = "30m"
+    # Потолок длины ответа в токенах. Ответы короткие, а модель генерирует ~18 ток/с:
+    # каждый лишний токен стоит ~55 мс. Потолок лишь страхует от затянувшегося ответа
+    # (JSON, обрезанный на нём, не проходит проверку и уходит на обычный повтор).
+    # Разбор: три цитаты evidence и несколько цитат hard_red_flags, русский ~2,5 символа на токен.
+    llm_num_predict_analyze: int = Field(default=400, ge=16)
+    llm_num_predict_reply: int = Field(default=160, ge=16)  # тактика + 1–2 короткие фразы
+    llm_num_predict_summary: int = Field(default=600, ge=16)  # отчёт о звонке: пять фраз и резюме
 
     # Пути
     schemes_dir: str = "data/schemes"
@@ -57,7 +67,13 @@ class Settings(BaseSettings):
     # Агент
     window_size: int = Field(default=8, ge=1)  # сколько последних реплик видит LLM
     detect_threshold: float = Field(default=0.6, ge=0.0, le=1.0)  # порог уверенности для тревоги
+    # Насколько новая схема должна быть увереннее объявленной, чтобы сменить её сразу,
+    # а не со второго выигранного хода подряд (ТЗ, «Устойчивость»).
+    switch_margin: float = Field(default=0.15, ge=0.0, le=1.0)
     recent_replies: int = Field(default=5, ge=0)  # сколько прошлых подсказок показать модели, чтобы не повторялась
+    # Сколько finish ждёт недописанную фоновую реплику модели, прежде чем отменить
+    # её и сохранить кейс: с запасом на одну генерацию qwen3:8b (~8 с).
+    reply_wait_s: float = Field(default=30.0, ge=0.0)
     # inprocess — MCP-сервер в том же процессе (быстрее, один индекс в памяти);
     # stdio — отдельным процессом, как настоящий внешний MCP-сервер.
     mcp_transport: Literal["inprocess", "stdio"] = "inprocess"

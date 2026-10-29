@@ -31,7 +31,9 @@ class EventSink:
 
     async def emit(self, type_: EventType, payload: dict[str, Any]) -> AgentEvent:
         """Создаёт событие и рассылает его во все приёмники. Возвращает созданное событие."""
-        event = AgentEvent(call_id=self.call_id, ts=datetime.now(UTC), type=type_, payload=payload)
+        event = AgentEvent(
+            call_id=self.call_id, seq=len(self.events), ts=datetime.now(UTC), type=type_, payload=payload
+        )
         self.events.append(event)
         if self._log_path is not None:
             # Одна короткая строка на событие: запись достаточно дешёвая,

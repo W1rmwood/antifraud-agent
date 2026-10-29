@@ -23,7 +23,7 @@ PAYLOAD_KEYS: dict[EventType, set[str]] = {
     EventType.call_ended: set(),
 }
 # Keys added later with backward compatibility: they may be missing in older logs.
-OPTIONAL_KEYS: dict[EventType, set[str]] = {EventType.suggestion: {"tactic"}}
+OPTIONAL_KEYS: dict[EventType, set[str]] = {EventType.suggestion: {"tactic"}, EventType.scheme_detected: {"stages"}}
 
 
 def assert_payload_keys(event: AgentEvent) -> None:

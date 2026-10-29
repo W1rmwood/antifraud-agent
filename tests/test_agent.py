@@ -9,6 +9,7 @@ import pytest
 from agent.config import Settings
 from agent.graph import AgentDeps
 from agent.llm import LLMError, generate_structured
+from agent.policy import HANGUP_DEFAULT
 from agent.prompts import BAIT_MODE, PROVOKE_MODE, Analysis, CallSummary, analysis_messages
 from agent.run import run_call
 from contracts import AgentEvent, AudioSource, CallCase, CallRequest, EventType, Speaker, Utterance
@@ -22,6 +23,10 @@ from tests.test_mock_events import assert_payload_keys
 PHONE = "+79990000001"
 CALL_001 = "data/calls/001.txt"
 TRANSFER = "их нужно сегодня же перевести на защищённый резервный счёт Центробанка"
+# Pause between utterances for tests that check turn-by-turn behaviour. run_call batches
+# whatever piles up while the model is busy, so an instant listener would be one batch;
+# fake turns take milliseconds, so with this pause every caller utterance gets its own turn.
+PACE_S = 0.05
 
 
 def safe_account_rule(prompt: str) -> Analysis:
@@ -86,7 +91,7 @@ async def test_fraud_call_end_to_end(tmp_path: Path) -> None:
     harness = Harness(tmp_path, llm)
     seed_history(harness.storage)
 
-    case = await harness.run("call-001", FakeListener())
+    case = await harness.run("call-001", FakeListener(delay_s=PACE_S))
     events = harness.events()
     types = [e.type for e in events]
 
@@ -116,13 +121,29 @@ async def test_fraud_call_end_to_end(tmp_path: Path) -> None:
     stages = [e.payload["stage_n"] for e in events if e.type == EventType.stage_changed]
     assert stages == [3, 2, 3]
 
-    # The warning quotes what the caller really demanded, once, after the scheme is declared.
-    warnings = [e.payload["text"] for e in events[events.index(detected[0]) :] if e.type == EventType.warning]
-    assert len(warnings) == 1 and TRANSFER in warnings[0]
+    # The transfer demand is flagged by the rules without the LLM, before the scheme is declared,
+    # and the LLM path does not repeat it with a second banner.
+    warnings = [e for e in events if e.type == EventType.warning]
+    transfer = [w for w in warnings if "перевести на защищённый резервный счёт" in w.payload["text"]]
+    assert len(transfer) == 1
+    assert transfer[0].payload["text"].startswith("Признак развода")
+    assert events.index(transfer[0]) < events.index(detected[0])
 
     # Replies to the scammer: generated only after declaration, creative temperature, no repeats.
     suggestions = [e.payload for e in events if e.type == EventType.suggestion]
-    assert suggestions == [{"text": DEFAULT_REPLY.text, "kind": "provoke", "tactic": "mockery"}]
+    assert [s for s in suggestions if s["kind"] != "hangup"] == [
+        {"text": DEFAULT_REPLY.text, "kind": "provoke", "tactic": "mockery"}
+    ]
+    # The safe way out is offered by code once the scheme is declared, and its text matches
+    # the scheme category (safe-account is a bank scheme). The model reply is generated in the
+    # background now, so the way out comes first, right after the analysis, not after the reply.
+    # Before that, the first rule hit already offered a general way out, without waiting for the model.
+    hangups = [s for s in suggestions if s["kind"] == "hangup"]
+    assert hangups == [
+        {"text": HANGUP_DEFAULT, "kind": "hangup"},
+        {"text": "Положите трубку и перезвоните в банк по номеру с обратной стороны карты.", "kind": "hangup"},
+    ]
+    assert suggestions[0] == hangups[0]
     replies = reply_prompts(llm)
     temperatures = {t for p, t in zip(llm.prompts, llm.temperatures, strict=True) if p in replies}
     assert replies and temperatures == {harness.settings.reply_temperature}
@@ -162,7 +183,7 @@ async def test_dead_llm_does_not_break_the_call(tmp_path: Path) -> None:
 
     harness = Harness(tmp_path, FakeLLM(dead, summary=None))
 
-    case = await harness.run("call-dead", FakeListener())
+    case = await harness.run("call-dead", FakeListener(delay_s=PACE_S))
 
     assert case.scheme_id is None
     assert "Схема не найдена" in case.summary
@@ -172,11 +193,14 @@ async def test_dead_llm_does_not_break_the_call(tmp_path: Path) -> None:
 async def test_dead_reply_keeps_detection(tmp_path: Path) -> None:
     harness = Harness(tmp_path, FakeLLM(safe_account_rule, summary=None, reply=None))
 
-    case = await harness.run("call-noreply", FakeListener())
+    case = await harness.run("call-noreply", FakeListener(delay_s=PACE_S))
 
-    types = {e.type for e in harness.events()}
+    events = harness.events()
     assert case.scheme_id == "safe-account"
-    assert EventType.scheme_detected in types and EventType.suggestion not in types
+    assert EventType.scheme_detected in {e.type for e in events}
+    # Without the LLM reply only the code-written way out is left: it does not depend on the model.
+    kinds = {e.payload["kind"] for e in events if e.type == EventType.suggestion}
+    assert kinds == {"hangup"}
 
 
 async def test_impossible_stage_is_ignored(tmp_path: Path) -> None:
@@ -184,7 +208,7 @@ async def test_impossible_stage_is_ignored(tmp_path: Path) -> None:
         return safe_account_rule(prompt).model_copy(update={"stage_n": 42})
 
     harness = Harness(tmp_path, FakeLLM(wrong_stage, summary=None))
-    case = await harness.run("call-stage", FakeListener())
+    case = await harness.run("call-stage", FakeListener(delay_s=PACE_S))
 
     assert case.scheme_id == "safe-account"
     assert case.max_stage is None

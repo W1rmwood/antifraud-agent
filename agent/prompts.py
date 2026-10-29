@@ -16,6 +16,7 @@
 в разные стороны.
 """
 
+import re
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -55,13 +56,17 @@ TACTIC_KIND: dict[Tactic, SuggestionKind] = {
 class Analysis(BaseModel):
     """Разбор текущего момента разговора."""
 
-    scheme_id: str | None = Field(description="id схемы из списка кандидатов или null для обычного звонка")
-    stage_n: int | None = Field(ge=1, description="номер этапа выбранной схемы или null")
-    confidence: float = Field(ge=0.0, le=1.0, description="уверенность, что идёт именно эта схема")
+    # Модель пишет JSON по порядку полей. Цитаты стоят первыми: сначала модель
+    # выписывает, что звонящий сказал и потребовал, и только потом выбирает схему.
+    # Когда scheme_id и confidence шли первыми, модель выбирала схему до того,
+    # как посмотрела на слова, и потом подгоняла под неё цитаты.
     hard_red_flags: list[str] = Field(
         description="дословные цитаты звонящего с жёсткими требованиями; пусто, если их нет"
     )
     evidence: list[str] = Field(max_length=3, description="до трёх дословных цитат, на которых основан вывод")
+    scheme_id: str | None = Field(description="id схемы из списка кандидатов или null для обычного звонка")
+    stage_n: int | None = Field(ge=1, description="номер этапа выбранной схемы или null")
+    confidence: float = Field(ge=0.0, le=1.0, description="уверенность, что идёт именно эта схема")
 
 
 class Reply(BaseModel):
@@ -130,9 +135,33 @@ def format_transcript(utterances: list[Utterance]) -> str:
     return "\n".join(f"{SPEAKER_LABEL[u.speaker]}: {u.text}" for u in utterances)
 
 
+# Хвост текста чанка (см. rag.chunks.stage_text): «<схема>. <легенда>. Этап N: <название>. <цель>.»
+_STAGE_LINE = re.compile(r"Этап \d+: (?P<name>.+?)\. (?P<goal>.+?)\.?$")
+CANDIDATE_PHRASES = 3  # сколько характерных фраз показывать у кандидата
+
+
+def format_candidate(hit: Hit) -> str:
+    """Один кандидат кратко: метка [scheme_id, этап N], название и цель этапа, 2–3 фразы, красные флаги.
+
+    Полный текст чанка (5–10 фраз, легенда, «Просят») втрое длиннее и почти не
+    добавляет информации. Чанк собран по фиксированному шаблону, поэтому поля
+    достаются из него разбором; если шаблон не узнан, отдаём текст как есть.
+    """
+    lines = hit.text.split("\n")
+    match = _STAGE_LINE.search(lines[-3]) if len(lines) >= 3 else None
+    if match is None or not lines[-2].startswith("Признаки: "):
+        return f"[{hit.scheme_id}, этап {hit.stage_n}]\n{hit.text}"
+    phrases = " | ".join(lines[:-3][:CANDIDATE_PHRASES])
+    flags = lines[-2].removeprefix("Признаки: ").rstrip(".")
+    return (
+        f"[{hit.scheme_id}, этап {hit.stage_n}] {match['name']}: {match['goal']}\n"
+        f"Фразы: {phrases}\nПризнаки: {flags}"
+    )
+
+
 def format_candidates(hits: list[Hit]) -> str:
     """Найденные этапы с пометкой [scheme_id, этап N], чтобы модель могла сослаться на id."""
-    return "\n\n".join(f"[{h.scheme_id}, этап {h.stage_n}]\n{h.text}" for h in hits)
+    return "\n\n".join(format_candidate(h) for h in hits)
 
 
 def format_scheme(scheme: Scheme) -> str:

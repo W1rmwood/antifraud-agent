@@ -15,6 +15,7 @@
 import argparse
 import importlib.util
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -450,6 +451,16 @@ def _health() -> dict[str, Any]:
         "key": "audio", "label": "Записи тестовых звонков", "ok": bool(wavs) and not pointers,
         "detail": "скачаны" if wavs and not pointers else "не скачаны из Git LFS",
         "fix": "git lfs install && git lfs pull",
+    })
+    # Модель распознавания речи качается при первом распознавании, а во время звонка интернета нет:
+    # без этой проверки звонок со звуком падает уже после «Старт». Расшифровкам (.txt) она не нужна.
+    whisper = os.environ.get("ANTIFRAUD_WHISPER_MODEL", "small")
+    hub = Path(os.environ.get("HF_HUB_CACHE", Path.home() / ".cache" / "huggingface" / "hub"))
+    cached = (hub / f"models--Systran--faster-whisper-{whisper}").is_dir()
+    checks.append({
+        "key": "asr", "label": f"Распознавание речи (whisper {whisper})", "ok": cached,
+        "detail": "модель скачана" if cached else "модель не скачана",
+        "fix": f".venv/bin/python -c \"from faster_whisper import WhisperModel; WhisperModel('{whisper}')\"",
     })
     model_ready = all(c["ok"] for c in checks if c["key"] in ("deps", "llm", "embed", "index"))
     return {"model_ready": model_ready, "checks": checks}

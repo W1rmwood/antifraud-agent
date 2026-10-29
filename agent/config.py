@@ -34,6 +34,16 @@ class Settings(BaseSettings):
     reply_temperature: float = Field(default=0.8, ge=0.0, le=2.0)
     llm_retries: int = Field(default=2, ge=0)  # сколько раз переспросить после невалидного JSON
     llm_timeout_s: float = 120.0
+    # Сколько Ollama держит модель в памяти после вызова. Загрузка qwen3:8b занимает
+    # ~5 с, а реплики идут каждые несколько секунд, поэтому выгружать её между ходами нельзя.
+    llm_keep_alive: str = "30m"
+    # Потолок длины ответа в токенах. Ответы короткие, а модель генерирует ~18 ток/с:
+    # каждый лишний токен стоит ~55 мс. Потолок лишь страхует от затянувшегося ответа
+    # (JSON, обрезанный на нём, не проходит проверку и уходит на обычный повтор).
+    # Разбор: три цитаты evidence и несколько цитат hard_red_flags, русский ~2,5 символа на токен.
+    llm_num_predict_analyze: int = Field(default=400, ge=16)
+    llm_num_predict_reply: int = Field(default=160, ge=16)  # тактика + 1–2 короткие фразы
+    llm_num_predict_summary: int = Field(default=600, ge=16)  # отчёт о звонке: пять фраз и резюме
 
     # Пути
     schemes_dir: str = "data/schemes"

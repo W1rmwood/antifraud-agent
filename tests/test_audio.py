@@ -58,11 +58,6 @@ def test_listen_from_transcript():
     assert all(a.t_end <= b.t_start for a, b in zip(utts, utts[1:]))
 
 
-def test_listen_rejects_live_modes_for_now():
-    with pytest.raises(NotImplementedError):
-        collect(AudioSource(kind="mic"))
-
-
 def test_listen_missing_file():
     with pytest.raises(FileNotFoundError):
         collect(AudioSource(kind="file", path="data/calls/nope.wav"))

@@ -303,6 +303,7 @@ class CallAgent:
             current_confidence=call.confidence,
             challenger=call.challenger,
             margin=self._deps.settings.switch_margin,
+            rule_hit=bool(call.rule_quotes),
         )
         call.challenger = decision.challenger
         if decision.scheme_id is None:
@@ -330,7 +331,10 @@ class CallAgent:
                 {
                     "scheme_id": scheme.id,
                     "scheme_name": scheme.name,
-                    "confidence": analysis.confidence,
+                    # У общей метки своей уверенности у модели нет (она её не выбирала):
+                    # показываем порог объявления — тревога поднята ровно на нём.
+                    "confidence": analysis.confidence if analysis.scheme_id == scheme.id
+                    else self._deps.settings.detect_threshold,
                     "evidence": list(dict.fromkeys(evidence)),
                     # Все этапы схемы: UI рисует прогресс по событиям, не читая data/schemes/.
                     "stages": [{"n": s.n, "name": s.name} for s in scheme.stages],

@@ -269,3 +269,30 @@ async def test_gives_up_after_retries() -> None:
     with pytest.raises(LLMError):
         await generate_structured(chat, [{"role": "user", "content": "hi"}], Analysis, retries=2)
     assert len(chat.histories) == 3
+
+
+async def test_demand_without_known_scheme_is_marked_as_generic_fraud(tmp_path: Path) -> None:
+    """Звонящий требует код, а подходящей схемы нет: агент ставит «мошенничество, схема не определена»."""
+    demand = "продиктуйте код из смс"
+
+    def no_scheme_but_demand(prompt: str) -> Analysis:
+        said = demand in prompt.split("Последние реплики:")[-1].lower()
+        return Analysis(scheme_id=None, stage_n=None, confidence=0.2,
+                        hard_red_flags=[demand] if said else [], evidence=[])
+
+    harness = Harness(tmp_path, FakeLLM(no_scheme_but_demand, CallSummary(legend=None, key_phrases=[], summary="Код.")))
+    listener = FakeListener([
+        (Speaker.caller, "Здравствуйте, это по поводу вашей заявки."),
+        (Speaker.caller, "Продиктуйте код из СМС, который сейчас придёт."),
+    ], delay_s=PACE_S)
+
+    case = await harness.run("call-generic", listener, phone=None)
+
+    events = harness.events()
+    detected = [e.payload for e in events if e.type == EventType.scheme_detected]
+    assert [d["scheme_id"] for d in detected] == ["unknown-fraud"]
+    assert detected[0]["scheme_name"] == "Мошенничество (схема не определена)"
+    assert detected[0]["confidence"] == harness.settings.detect_threshold  # своей уверенности у модели нет
+    assert [s["n"] for s in detected[0]["stages"]] == [1, 2, 3]
+    assert any(e.type == EventType.suggestion and e.payload["kind"] == "hangup" for e in events)
+    assert case.scheme_id == "unknown-fraud" and case.max_stage == 3

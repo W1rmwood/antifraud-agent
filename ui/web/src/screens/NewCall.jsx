@@ -12,10 +12,11 @@ const TABS = [
 ]
 const ACCEPT = '.wav,.flac,.ogg,.mp3,.txt'
 
-/** Чего не хватает для звонка через модель: записи — ничего, аудиофайлам из репозитория — ещё и Git LFS. */
-function blockers(health, { lfs = false } = {}) {
+/** Чего не хватает для звонка через модель: записи — ничего, аудиофайлам из репозитория — ещё и Git LFS,
+ *  звуку (файл или микрофон) — модель распознавания речи. */
+function blockers(health, { lfs = false, asr = lfs } = {}) {
   if (!health) return []
-  const need = ['deps', 'llm', 'embed', 'index', ...(lfs ? ['audio'] : [])]
+  const need = ['deps', 'llm', 'embed', 'index', ...(lfs ? ['audio'] : []), ...(asr ? ['asr'] : [])]
   return health.checks.filter((c) => need.includes(c.key) && !c.ok)
 }
 
@@ -82,7 +83,7 @@ function Live({ health, busy, onStarted, showProvoke, setShowProvoke }) {
   const [source, setSource] = useState('mic')
   const [phone, setPhone] = useState('')
   const { start, starting, error } = useStart(onStarted)
-  const missing = blockers(health)
+  const missing = blockers(health, { asr: true })
   return (
     <div className="newcall">
       <div className="mode-main">

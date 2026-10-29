@@ -120,7 +120,7 @@ def test_health_lists_what_a_model_call_needs(base: str) -> None:
     status, health = request(f"{base}/api/health")
     assert status == 200 and isinstance(health["model_ready"], bool)
     keys = [c["key"] for c in health["checks"]]
-    assert keys == ["deps", "llm", "embed", "index", "db", "audio"]
+    assert keys == ["deps", "llm", "embed", "index", "db", "audio", "asr"]
     assert all({"label", "ok", "detail", "fix"} <= c.keys() for c in health["checks"])
     # Без зависимостей, модели или индекса звонок через модель не готов.
     if not all(c["ok"] for c in health["checks"] if c["key"] in ("deps", "llm", "embed", "index")):

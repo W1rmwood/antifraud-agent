@@ -55,8 +55,14 @@ def stage_text(scheme: Scheme, stage: Stage) -> str:
     return "\n".join(parts)
 
 
+# Общая метка «мошенничество, схема не определена» (data/schemes/unknown-fraud.json). Её ставит
+# агент сам, когда требования мошенника есть, а известная схема не нашлась. В поиск она не идёт:
+# она похожа на всё сразу и перехватывала бы совпадения у настоящих схем.
+GENERIC_SCHEME_ID = "unknown-fraud"
+
+
 def scheme_chunks(schemes: dict[str, Scheme]) -> list[Chunk]:
-    """Превращает все схемы в плоский список чанков, по одному на этап."""
+    """Превращает все схемы, кроме общей метки, в плоский список чанков, по одному на этап."""
     return [
         Chunk(
             id=f"{scheme.id}#{stage.n}",
@@ -66,6 +72,7 @@ def scheme_chunks(schemes: dict[str, Scheme]) -> list[Chunk]:
             text=stage_text(scheme, stage),
         )
         for scheme in schemes.values()
+        if scheme.id != GENERIC_SCHEME_ID
         for stage in scheme.stages
     ]
 

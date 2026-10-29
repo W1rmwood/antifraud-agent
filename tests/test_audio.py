@@ -73,3 +73,41 @@ def test_listen_wav_stereo_and_mono():
 
     mono = collect(AudioSource(kind="file", path="data/calls/011.wav"), "c011")
     assert mono and {u.speaker for u in mono} == {Speaker.unknown}
+
+
+@pytest.mark.parametrize("text", [
+    "ПОЛИЦЕЙСКАЯ СИРЕНА",                 # описание звука капсом, как в субтитрах
+    "Увидимся в следующем видео!",
+    "Подписывайтесь на наш канал!",
+    "Редактор субтитров Н.Закомолдина",
+    "Корректор А.Егорова",
+    "Продолжение следует...",
+    "Спасибо за просмотр.",
+    "[музыка]",
+    "(смех)",
+])
+def test_whisper_hallucinations_are_dropped(text):
+    from audio.asr import is_hallucination
+    assert is_hallucination(text)
+
+
+@pytest.mark.parametrize("text", [
+    "Алло.", "Здравствуйте.", "Да.", "ЦБ", "Сбербанк, служба безопасности.",
+    "не могли бы вы скинуть номер своей карты.",
+    "Переведите деньги на резервный счёт ЦБ РФ.",
+    "Это МВД, вам звонит майор Кузнецов.",
+])
+def test_real_phrases_are_kept(text):
+    from audio.asr import is_hallucination
+    assert not is_hallucination(text)
+
+
+@pytest.mark.skipif(os.environ.get("RUN_ASR") != "1", reason="RUN_ASR=1 включает распознавание")
+def test_noise_bursts_do_not_become_phrases():
+    """Полсекунды шума или «сирены» с микрофона — не реплика (раньше выходило «Подписывайтесь на наш канал!»)."""
+    from audio.asr import transcribe
+    rng = np.random.default_rng(0)
+    t = np.arange(int(SAMPLE_RATE * 0.4)) / SAMPLE_RATE
+    siren = (0.3 * np.sin(2 * np.pi * (700 + 300 * np.sin(2 * np.pi * 3 * t)) * t)).astype(np.float32)
+    noise = (rng.standard_normal(SAMPLE_RATE) * 0.005).astype(np.float32)
+    assert transcribe(siren) == "" and transcribe(noise) == ""

@@ -159,12 +159,15 @@ class AgentEvent(Contract):
 
     Что лежит в payload каждого типа:
 
+    Что лежит в payload каждого типа (модели — PAYLOAD_MODELS ниже, разбор — parse_payload):
+
     - call_started: {phone, source}
     - transcript: Utterance
-    - scheme_detected: {scheme_id, scheme_name, confidence, evidence: [str]}
+    - scheme_detected: {scheme_id, scheme_name, confidence, evidence: [str], stages?: [{n, name}]}
+      — stages есть в логах после 30.10: все этапы схемы, чтобы UI рисовал прогресс без data/schemes/
     - stage_changed: {scheme_id, stage_n, stage_name, next_move}
     - suggestion: {text, kind: SuggestionKind, tactic?} — tactic есть только у
-      подсказок агента (см. agent.prompts.TACTICS), в старых логах его нет
+      подсказок модели (см. agent.prompts.TACTICS), у hangup и в старых логах его нет
     - warning: {text}
     - tool_call: {tool, args}
     - tool_result: {tool, ok, result}
@@ -173,10 +176,12 @@ class AgentEvent(Contract):
     """
 
     call_id: NonEmptyStr
+    # Номер события в звонке с 0, без пропусков: UI по нему понимает, что уже показал.
+    # None — в логах, записанных до 30.10.
+    seq: int | None = Field(default=None, ge=0)
     ts: datetime
     type: EventType
-    # Намеренно просто словарь: форма зависит от type, а строгая модель на
-    # каждый тип пока не нужна. Проверяет её tests/test_mock_events.py.
+    # Словарь, а не одна модель: форма зависит от type. Типизированно — parse_payload(event).
     payload: dict[str, Any]
 
 
@@ -232,3 +237,77 @@ class CallIndexEntry(Contract):
     scheme_id: SchemeId | None  # None — звонок без мошенничества
     channels: Literal["stereo", "mono"]
     transcript: NonEmptyStr
+
+
+# --- Payload событий AgentEvent по типам ---
+# Модели для того, кто читает события (UI, eval): payload проверяется и разбирается
+# по ним, а не угадывается. Агент пишет payload словарём, тесты сверяют его с этими моделями.
+
+
+class CallStartedPayload(Contract):
+    phone: Phone | None  # None — номер неизвестен (живой звонок)
+    source: AudioSource
+
+
+class StageInfo(Contract):
+    n: int = Field(ge=1)
+    name: NonEmptyStr
+
+
+class SchemeDetectedPayload(Contract):
+    scheme_id: SchemeId
+    scheme_name: NonEmptyStr
+    confidence: float = Field(ge=0.0, le=1.0)
+    evidence: list[str]  # дословные фразы звонящего, на которых основан вывод
+    stages: list[StageInfo] = []  # все этапы схемы по порядку; пусто в старых логах
+
+
+class StageChangedPayload(Contract):
+    scheme_id: SchemeId
+    stage_n: int = Field(ge=1)
+    stage_name: NonEmptyStr
+    next_move: str  # что мошенник обычно делает дальше
+
+
+class SuggestionPayload(Contract):
+    text: NonEmptyStr
+    kind: SuggestionKind
+    tactic: str | None = None
+
+
+class WarningPayload(Contract):
+    text: NonEmptyStr
+
+
+class ToolCallPayload(Contract):
+    tool: NonEmptyStr
+    args: dict[str, Any]
+
+
+class ToolResultPayload(Contract):
+    tool: NonEmptyStr
+    ok: bool
+    result: Any
+
+
+class EmptyPayload(Contract):
+    pass
+
+
+PAYLOAD_MODELS: dict[EventType, type[BaseModel]] = {
+    EventType.call_started: CallStartedPayload,
+    EventType.transcript: Utterance,
+    EventType.scheme_detected: SchemeDetectedPayload,
+    EventType.stage_changed: StageChangedPayload,
+    EventType.suggestion: SuggestionPayload,
+    EventType.warning: WarningPayload,
+    EventType.tool_call: ToolCallPayload,
+    EventType.tool_result: ToolResultPayload,
+    EventType.summary: CallCase,
+    EventType.call_ended: EmptyPayload,
+}
+
+
+def parse_payload(event: AgentEvent) -> BaseModel:
+    """Payload события как модель его типа. Бросает ValidationError, если форма не та."""
+    return PAYLOAD_MODELS[event.type].model_validate(event.payload)

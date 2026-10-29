@@ -2,6 +2,7 @@
 
 from contracts.interfaces import Listener, Storage
 from contracts.models import (
+    PAYLOAD_MODELS,
     AgentEvent,
     AudioSource,
     CallCase,
@@ -14,9 +15,11 @@ from contracts.models import (
     Speaker,
     Stage,
     Utterance,
+    parse_payload,
 )
 
 __all__ = [
+    "PAYLOAD_MODELS",
     "AgentEvent",
     "AudioSource",
     "CallCase",
@@ -31,4 +34,5 @@ __all__ = [
     "Stage",
     "Storage",
     "Utterance",
+    "parse_payload",
 ]

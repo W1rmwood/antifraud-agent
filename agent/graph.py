@@ -332,6 +332,8 @@ class CallAgent:
                     "scheme_name": scheme.name,
                     "confidence": analysis.confidence,
                     "evidence": list(dict.fromkeys(evidence)),
+                    # Все этапы схемы: UI рисует прогресс по событиям, не читая data/schemes/.
+                    "stages": [{"n": s.n, "name": s.name} for s in scheme.stages],
                 },
             )
 

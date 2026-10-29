@@ -4,6 +4,7 @@
 
     python -m agent.run data/calls/001.wav --phone +79990000001 [--realtime] [--json]
     python -m agent.run --mic        # живой звонок на громкой связи, Ctrl+C — закончить
+    python -m agent.run --call-id c001 --source file --path data/calls/001.wav   # контракт №7, для UI
 
 Слух и разбор идут параллельно: фраза попадает на экран сразу после
 распознавания, а LLM разбирает то, что накопилось, пока она думала над
@@ -208,7 +209,11 @@ def format_event(event: AgentEvent, elapsed_s: float, color: bool = False) -> st
 
 
 async def _main(
-    source: AudioSource, phone: str | None, realtime: bool = False, raw_json: bool = False
+    source: AudioSource,
+    phone: str | None,
+    realtime: bool = False,
+    raw_json: bool = False,
+    call_id: str | None = None,
 ) -> None:
     """Прогон одного звонка с печатью событий в консоль.
 
@@ -221,7 +226,8 @@ async def _main(
 
     settings = get_settings()
     deps = default_deps(settings)
-    request = CallRequest(call_id=f"cli-{uuid.uuid4().hex[:8]}", source=source, phone=phone)
+    # call_id задаёт тот, кто запускает (UI): по нему он находит лог data/runs/<call_id>.jsonl.
+    request = CallRequest(call_id=call_id or f"cli-{uuid.uuid4().hex[:8]}", source=source, phone=phone)
     queue: asyncio.Queue[AgentEvent] = asyncio.Queue()
     started = time.monotonic()
     color = sys.stdout.isatty()
@@ -238,12 +244,17 @@ async def _main(
     loop = asyncio.get_running_loop()
 
     def on_interrupt() -> None:
-        # Первый Ctrl+C штатно заканчивает звонок, второй — обычное прерывание.
-        loop.remove_signal_handler(signal.SIGINT)
-        print("\nЗаканчиваю звонок: дожидаюсь разбора и сохраняю кейс… (ещё раз Ctrl+C — прервать)", flush=True)
+        # Первый Ctrl+C (или SIGTERM от UI, кнопка «Стоп») штатно заканчивает звонок:
+        # разбор дорабатывает, отчёт и кейс сохраняются, в лог уходит call_ended.
+        # Второй сигнал — обычное прерывание.
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(sig)
+        print("\nЗаканчиваю звонок: дожидаюсь разбора и сохраняю кейс… (ещё раз Ctrl+C — прервать)",
+              file=sys.stderr, flush=True)
         stop.set()
 
-    loop.add_signal_handler(signal.SIGINT, on_interrupt)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, on_interrupt)
 
     def listener(src: AudioSource, call_id: str) -> AsyncIterator[Utterance]:
         # Контракт Listener — (source, call_id); темп и остановку подставляем здесь.
@@ -258,26 +269,37 @@ async def _main(
 
 
 def main() -> None:
-    """Точка входа `python -m agent.run <файл> | --mic | --loopback`."""
+    """Точка входа: `python -m agent.run <файл> | --mic | --loopback` или форма контракта №7 для UI.
+
+    Контракт №7 (её запускает кнопка «Старт»):
+        python -m agent.run --call-id c001 --source file --path data/calls/001.wav [--phone +7…] [--json]
+    """
     parser = argparse.ArgumentParser(description="Run the agent on one call and print what the user would see.")
     parser.add_argument("path", nargs="?", help="audio file or a .txt transcript ('caller: ...' lines)")
     live = parser.add_mutually_exclusive_group()
     live.add_argument("--mic", action="store_true", help="live call from the microphone (speakerphone); Ctrl+C ends it")
     live.add_argument("--loopback", action="store_true", help="live call from system audio (ANTIFRAUD_LOOPBACK_DEVICE)")
+    live.add_argument("--source", choices=["file", "mic", "loopback"], help="contract #7: where the sound comes from")
+    parser.add_argument("--path", dest="path_opt", help="contract #7: call file for --source file")
+    parser.add_argument("--call-id", default=None, help="call id; events go to data/runs/<call-id>.jsonl")
     parser.add_argument("--phone", default=None, help="caller number, +7XXXXXXXXXX")
     parser.add_argument("--realtime", action="store_true", help="file only: emit utterances at the pace of a live call")
     parser.add_argument("--json", action="store_true", help="print raw events as JSON lines")
     args = parser.parse_args()
-    if bool(args.path) == (args.mic or args.loopback):
-        parser.error("укажите файл звонка или --mic / --loopback")
-    if args.path:
-        source = AudioSource(kind="file", path=args.path)
-    else:
-        source = AudioSource(kind="mic" if args.mic else "loopback")
+
+    path = args.path or args.path_opt
+    kind = args.source or ("mic" if args.mic else "loopback" if args.loopback else "file" if path else None)
+    if kind is None:
+        parser.error("укажите файл звонка, --mic, --loopback или --source")
+    if kind == "file" and not path:
+        parser.error("для --source file нужен путь к звонку: --path <файл>")
+    if kind != "file" and path:
+        parser.error("файл звонка указывают только для --source file")
+    source = AudioSource(kind=kind, path=path) if kind == "file" else AudioSource(kind=kind)
     # В читаемом режиме служебные логи (HTTP-запросы к Ollama) только мешают.
     logging.basicConfig(level=logging.INFO if args.json else logging.WARNING,
                         format="%(levelname)s %(name)s: %(message)s")
-    asyncio.run(_main(source, args.phone, args.realtime, args.json))
+    asyncio.run(_main(source, args.phone, args.realtime, args.json, args.call_id))
 
 
 if __name__ == "__main__":

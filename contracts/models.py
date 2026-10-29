@@ -1,9 +1,9 @@
-"""Data contracts shared by every module of the project.
+"""Контракты данных, общие для всех модулей проекта.
 
-Modules never talk to each other directly: audio, agent, storage and UI only
-exchange the models defined here. Any change to this file affects the whole
-team, so new fields must come with defaults and old fields must not be removed
-silently.
+Модули не обращаются друг к другу напрямую: звук, агент, хранилище и UI
+обмениваются только моделями из этого файла. Любое изменение здесь затрагивает
+всю команду, поэтому новые поля добавляются только со значением по умолчанию,
+а старые поля молча не удаляются.
 """
 
 from datetime import datetime
@@ -12,28 +12,37 @@ from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+# Границы размеров схемы: меньше трёх этапов — это не схема, а одна фраза;
+# больше семи — схему стоит разбить на две.
 MIN_STAGES = 3
 MAX_STAGES = 7
 MIN_TYPICAL_PHRASES = 5
 MAX_TYPICAL_PHRASES = 10
 
+# slug латиницей через дефис: "safe-account". Он же имя файла data/schemes/<id>.json.
 SchemeId = Annotated[str, StringConstraints(pattern=r"^[a-z0-9]+(-[a-z0-9]+)*$")]
+# Только нормализованный российский номер. Приводить к этому виду — задача того,
+# кто создаёт модель (storage/db.py: normalize_phone), а не самой модели.
 Phone = Annotated[str, StringConstraints(pattern=r"^\+7\d{10}$")]
+# Строка, в которой после обрезки пробелов осталось хоть что-то.
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
 class Contract(BaseModel):
-    """Base for all contracts.
+    """Базовый класс всех контрактов.
 
-    `extra="forbid"` turns a typo in a hand-written scheme JSON into an error
-    instead of a silently ignored field. `frozen=True` keeps messages immutable
-    once they are passed between modules; use `model_copy(update=...)` instead.
+    `extra="forbid"` превращает опечатку в имени поля в рукописном JSON схемы
+    в ошибку, а не в молча проигнорированное поле. `frozen=True` делает
+    сообщения неизменяемыми после передачи между модулями: чтобы получить
+    изменённую копию, используй `model_copy(update=...)`.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
 class SchemeCategory(StrEnum):
+    """Категория схемы: под кого маскируется мошенник."""
+
     bank = "bank"
     gosuslugi = "gosuslugi"
     relative = "relative"
@@ -43,23 +52,27 @@ class SchemeCategory(StrEnum):
 
 
 class Stage(Contract):
-    n: int = Field(ge=1)
+    """Один этап схемы развода. Он же единица поиска в RAG (один чанк)."""
+
+    n: int = Field(ge=1)  # номер этапа, с 1
     name: NonEmptyStr
-    goal: NonEmptyStr
+    goal: NonEmptyStr  # чего мошенник добивается на этапе
     typical_phrases: list[NonEmptyStr] = Field(
         min_length=MIN_TYPICAL_PHRASES, max_length=MAX_TYPICAL_PHRASES
     )
     red_flags: list[NonEmptyStr]
-    asks_for: list[NonEmptyStr]
-    next_move: NonEmptyStr
+    asks_for: list[NonEmptyStr]  # что просят: код из СМС, перевод, данные карты
+    next_move: NonEmptyStr  # что мошенник сделает дальше
 
 
 class Scheme(Contract):
+    """Схема развода целиком: легенда, этапы и как тянуть время. Файл data/schemes/<id>.json."""
+
     id: SchemeId
     name: NonEmptyStr
     aliases: list[NonEmptyStr] = []
     category: SchemeCategory
-    legend: NonEmptyStr
+    legend: NonEmptyStr  # кем представляются
     description: NonEmptyStr
     stages: list[Stage] = Field(min_length=MIN_STAGES, max_length=MAX_STAGES)
     pressure_points: list[NonEmptyStr]
@@ -68,8 +81,10 @@ class Scheme(Contract):
 
     @model_validator(mode="after")
     def _stages_numbered_in_order(self) -> Self:
-        # Retrieval stores stage_n as chunk metadata, so gaps or duplicates
-        # would make "stage 3" point to the wrong chunk.
+        """Этапы должны идти подряд: 1, 2, 3, ... без пропусков и повторов."""
+        # Поиск хранит stage_n в метаданных чанка, и агент берёт этап как
+        # stages[stage_n - 1]. Пропуск или дубль номера увёл бы «этап 3»
+        # не на тот чанк.
         numbers = [stage.n for stage in self.stages]
         expected = list(range(1, len(self.stages) + 1))
         if numbers != expected:
@@ -78,38 +93,48 @@ class Scheme(Contract):
 
 
 class Speaker(StrEnum):
+    """Кто говорит. В стерео левый канал — звонящий (caller), правый — абонент (user)."""
+
     caller = "caller"
     user = "user"
-    unknown = "unknown"
+    unknown = "unknown"  # моно-запись: голоса не различить
 
 
 class Utterance(Contract):
+    """Одна фраза из звонка, уже распознанная в текст. Звук до агента не доходит."""
+
     call_id: NonEmptyStr
-    seq: int = Field(ge=0)
+    seq: int = Field(ge=0)  # порядковый номер фразы в звонке, с 0
     speaker: Speaker
     text: NonEmptyStr
-    t_start: float = Field(ge=0)
+    t_start: float = Field(ge=0)  # секунды от начала звонка
     t_end: float = Field(ge=0)
 
     @model_validator(mode="after")
     def _ends_after_start(self) -> Self:
+        """Фраза не может закончиться раньше, чем началась."""
         if self.t_end < self.t_start:
             raise ValueError(f"t_end ({self.t_end}) is before t_start ({self.t_start})")
         return self
 
 
 class AudioSource(Contract):
+    """Откуда брать звук: файл, микрофон или системный звук (loopback)."""
+
     kind: Literal["file", "mic", "loopback"]
     path: str | None = None
 
     @model_validator(mode="after")
     def _file_needs_path(self) -> Self:
+        """Для файла путь обязателен, для микрофона и loopback он не нужен."""
         if self.kind == "file" and not self.path:
             raise ValueError("audio source of kind 'file' requires a path")
         return self
 
 
 class EventType(StrEnum):
+    """Типы событий агента. Что лежит в payload каждого типа — в таблице в CLAUDE.md."""
+
     call_started = "call_started"
     transcript = "transcript"
     scheme_detected = "scheme_detected"
@@ -122,34 +147,57 @@ class EventType(StrEnum):
     call_ended = "call_ended"
 
 
-class AgentEvent(Contract):
-    """One step of the agent, streamed to the UI and logged to data/runs/.
+# Вид подсказки. stall — тянуть время, подыгрывая; question — уточняющий вопрос;
+# provoke — бесить мошенника (абсурд, перехват роли, издёвка, мат).
+SuggestionKind = Literal["stall", "question", "provoke"]
 
-    Payload shape per event type is documented in CLAUDE.md.
+
+class AgentEvent(Contract):
+    """Один шаг агента. Уходит в UI и пишется в лог data/runs/<call_id>.jsonl.
+
+    Что лежит в payload каждого типа:
+
+    - call_started: {phone, source}
+    - transcript: Utterance
+    - scheme_detected: {scheme_id, scheme_name, confidence, evidence: [str]}
+    - stage_changed: {scheme_id, stage_n, stage_name, next_move}
+    - suggestion: {text, kind: SuggestionKind, tactic?} — tactic есть только у
+      подсказок агента (см. agent.prompts.TACTICS), в старых логах его нет
+    - warning: {text}
+    - tool_call: {tool, args}
+    - tool_result: {tool, ok, result}
+    - summary: CallCase
+    - call_ended: {}
     """
 
     call_id: NonEmptyStr
     ts: datetime
     type: EventType
+    # Намеренно просто словарь: форма зависит от type, а строгая модель на
+    # каждый тип пока не нужна. Проверяет её tests/test_mock_events.py.
     payload: dict[str, Any]
 
 
 class NumberInfo(Contract):
+    """История номера из хранилища. Неизвестный номер — calls_count=0, а не ошибка."""
+
     phone: Phone
     calls_count: int = Field(ge=0)
     first_seen: datetime | None
     last_seen: datetime | None
-    schemes: list[SchemeId]
+    schemes: list[SchemeId]  # схемы прошлых звонков с этого номера
     tags: list[NonEmptyStr]
 
 
 class CallCase(Contract):
+    """Отчёт о завершённом звонке. Агент сохраняет его через MCP-инструмент save_case."""
+
     call_id: NonEmptyStr
     phone: Phone | None
     started_at: datetime
     ended_at: datetime | None
-    scheme_id: SchemeId | None
-    max_stage: Annotated[int, Field(ge=1)] | None
+    scheme_id: SchemeId | None  # None — схема не найдена
+    max_stage: Annotated[int, Field(ge=1)] | None  # самый дальний этап, до которого дошёл мошенник
     legend: str | None
     key_phrases: list[str]
     summary: str
@@ -157,13 +205,14 @@ class CallCase(Contract):
 
     @model_validator(mode="after")
     def _ends_after_start(self) -> Self:
+        """Звонок не может закончиться раньше, чем начался."""
         if self.ended_at is not None and self.ended_at < self.started_at:
             raise ValueError("ended_at is before started_at")
         return self
 
 
 class CallRequest(Contract):
-    """What starts a call: where the audio comes from and who is calling."""
+    """С чего начинается звонок: откуда звук и кто звонит."""
 
     call_id: NonEmptyStr
     source: AudioSource
@@ -171,13 +220,13 @@ class CallRequest(Contract):
 
 
 class CallIndexEntry(Contract):
-    """One record of data/calls/index.json, paths relative to data/calls/.
+    """Одна запись data/calls/index.json. Пути — относительно data/calls/.
 
-    In a stereo file the left channel is the caller and the right one is the user.
+    В стерео-файле левый канал — звонящий, правый — абонент.
     """
 
     file: NonEmptyStr
     phone: Phone | None
-    scheme_id: SchemeId | None  # None for a call without fraud
+    scheme_id: SchemeId | None  # None — звонок без мошенничества
     channels: Literal["stereo", "mono"]
     transcript: NonEmptyStr

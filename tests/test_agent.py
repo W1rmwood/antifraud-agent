@@ -122,7 +122,15 @@ async def test_fraud_call_end_to_end(tmp_path: Path) -> None:
 
     # Replies to the scammer: generated only after declaration, creative temperature, no repeats.
     suggestions = [e.payload for e in events if e.type == EventType.suggestion]
-    assert suggestions == [{"text": DEFAULT_REPLY.text, "kind": "provoke", "tactic": "mockery"}]
+    assert [s for s in suggestions if s["kind"] != "hangup"] == [
+        {"text": DEFAULT_REPLY.text, "kind": "provoke", "tactic": "mockery"}
+    ]
+    # The safe way out is offered by code once the scheme is declared, right after the reply,
+    # and its text matches the scheme category (safe-account is a bank scheme).
+    hangups = [s for s in suggestions if s["kind"] == "hangup"]
+    assert hangups == [{"text": "Положите трубку и перезвоните в банк по номеру с обратной стороны карты.",
+                        "kind": "hangup"}]
+    assert suggestions.index(hangups[0]) == 1
     replies = reply_prompts(llm)
     temperatures = {t for p, t in zip(llm.prompts, llm.temperatures, strict=True) if p in replies}
     assert replies and temperatures == {harness.settings.reply_temperature}
@@ -174,9 +182,12 @@ async def test_dead_reply_keeps_detection(tmp_path: Path) -> None:
 
     case = await harness.run("call-noreply", FakeListener())
 
-    types = {e.type for e in harness.events()}
+    events = harness.events()
     assert case.scheme_id == "safe-account"
-    assert EventType.scheme_detected in types and EventType.suggestion not in types
+    assert EventType.scheme_detected in {e.type for e in events}
+    # Without the LLM reply only the code-written way out is left: it does not depend on the model.
+    kinds = {e.payload["kind"] for e in events if e.type == EventType.suggestion}
+    assert kinds == {"hangup"}
 
 
 async def test_impossible_stage_is_ignored(tmp_path: Path) -> None:

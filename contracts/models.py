@@ -148,8 +148,10 @@ class EventType(StrEnum):
 
 
 # Вид подсказки. stall — тянуть время, подыгрывая; question — уточняющий вопрос;
-# provoke — бесить мошенника (абсурд, перехват роли, издёвка, мат).
-SuggestionKind = Literal["stall", "question", "provoke"]
+# provoke — бесить мошенника (абсурд, перехват роли, издёвка, мат);
+# hangup — закончить разговор и перезвонить по официальному номеру (ТЗ, контракт №3:
+# среди подсказок всегда есть этот вариант; текст пишет код, а не модель).
+SuggestionKind = Literal["stall", "question", "provoke", "hangup"]
 
 
 class AgentEvent(Contract):

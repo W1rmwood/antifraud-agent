@@ -29,7 +29,7 @@ from langgraph.graph.state import CompiledStateGraph
 from agent.config import Settings
 from agent.events import EventSink
 from agent.llm import LLM, LLMError
-from agent.policy import decide, provoke_mode, quote_is_said
+from agent.policy import decide, hangup_text, provoke_mode, quote_is_said
 from agent.prompts import TACTIC_KIND, Analysis, CallSummary, Reply, analysis_messages, reply_messages, summary_messages
 from agent.tools import ToolClient
 from contracts import AudioSource, CallCase, EventType, NumberInfo, Scheme, Speaker, Utterance
@@ -80,9 +80,12 @@ class CallState:
     phone: str | None = None
     transcript: list[Utterance] = field(default_factory=list)
     scheme: Scheme | None = None  # объявленная схема
+    confidence: float | None = None  # уверенность модели в объявленной схеме на последнем её ходу
+    challenger: str | None = None  # схема, которая обошла объявленную на прошлом ходу
     stage_n: int | None = None  # текущий этап
     max_stage: int | None = None  # самый дальний этап за звонок; уходит в CallCase
     flags: list[str] = field(default_factory=list)  # подтверждённые требования мошенника после объявления схемы
+    offer_hangup: bool = False  # на этом ходу показать подсказку «закончить разговор»
     suggestions: list[str] = field(default_factory=list)  # отправленные подсказки: модели — чтобы не повторялась
 
 
@@ -132,6 +135,13 @@ class CallAgent:
         window = self.state.transcript[-self._deps.settings.window_size :]
         started = time.perf_counter()
         result = await self._graph.ainvoke({"window": window})
+        if self.state.offer_hangup and self.state.scheme is not None:
+            # После реплики-затяжки, чтобы безопасный выход был последней подсказкой хода.
+            # Текст пишет код: модель не может «забыть» предложить положить трубку.
+            self.state.offer_hangup = False
+            await self._sink.emit(
+                EventType.suggestion, {"text": hangup_text(self.state.scheme), "kind": "hangup"}
+            )
         self.turns.append(
             Turn(
                 seq=utterance.seq,
@@ -215,11 +225,19 @@ class CallAgent:
             self._deps.settings.detect_threshold,
             current=call.scheme.id if call.scheme else None,
             current_stage=call.stage_n,
+            current_confidence=call.confidence,
+            challenger=call.challenger,
+            margin=self._deps.settings.switch_margin,
         )
+        call.challenger = decision.challenger
         if decision.scheme_id is None:
             # Схема не объявлена: подсказки и предупреждения не показываем,
             # чтобы не пугать человека на обычном звонке.
             return {}
+        if analysis.scheme_id == decision.scheme_id:
+            # Запоминаем уверенность, только когда модель выбрала объявленную схему:
+            # с ней сравнивается следующий претендент.
+            call.confidence = analysis.confidence
 
         if call.scheme is None or decision.scheme_id != call.scheme.id:
             # Новая схема (впервые или сменилась): берём её целиком через MCP.
@@ -227,6 +245,7 @@ class CallAgent:
             if scheme is None:
                 return {}
             call.scheme, call.stage_n = scheme, None
+            call.offer_hangup = True
             # В доказательства идут подтверждённые флаги и только те цитаты
             # модели, которые реально прозвучали. dict.fromkeys убирает
             # повторы с сохранением порядка.
@@ -247,6 +266,8 @@ class CallAgent:
         new_flags = [f for f in decision.flags if f not in call.flags]
         if new_flags:
             call.flags += new_flags
+            # Мошенник выдвинул новое требование (код, перевод, наличные) — снова напоминаем про выход.
+            call.offer_hangup = True
             quotes = "; ".join(f"«{f}»" for f in new_flags)
             text = f"Мошенник требует: {quotes}. Ничего не называй и не переводи."
             await self._sink.emit(EventType.warning, {"text": text})

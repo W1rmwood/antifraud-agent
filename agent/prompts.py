@@ -55,13 +55,17 @@ TACTIC_KIND: dict[Tactic, SuggestionKind] = {
 class Analysis(BaseModel):
     """Разбор текущего момента разговора."""
 
-    scheme_id: str | None = Field(description="id схемы из списка кандидатов или null для обычного звонка")
-    stage_n: int | None = Field(ge=1, description="номер этапа выбранной схемы или null")
-    confidence: float = Field(ge=0.0, le=1.0, description="уверенность, что идёт именно эта схема")
+    # Модель пишет JSON по порядку полей. Цитаты стоят первыми: сначала модель
+    # выписывает, что звонящий сказал и потребовал, и только потом выбирает схему.
+    # Когда scheme_id и confidence шли первыми, модель выбирала схему до того,
+    # как посмотрела на слова, и потом подгоняла под неё цитаты.
     hard_red_flags: list[str] = Field(
         description="дословные цитаты звонящего с жёсткими требованиями; пусто, если их нет"
     )
     evidence: list[str] = Field(max_length=3, description="до трёх дословных цитат, на которых основан вывод")
+    scheme_id: str | None = Field(description="id схемы из списка кандидатов или null для обычного звонка")
+    stage_n: int | None = Field(ge=1, description="номер этапа выбранной схемы или null")
+    confidence: float = Field(ge=0.0, le=1.0, description="уверенность, что идёт именно эта схема")
 
 
 class Reply(BaseModel):

@@ -61,6 +61,9 @@ class Settings(BaseSettings):
     # а не со второго выигранного хода подряд (ТЗ, «Устойчивость»).
     switch_margin: float = Field(default=0.15, ge=0.0, le=1.0)
     recent_replies: int = Field(default=5, ge=0)  # сколько прошлых подсказок показать модели, чтобы не повторялась
+    # Сколько finish ждёт недописанную фоновую реплику модели, прежде чем отменить
+    # её и сохранить кейс: с запасом на одну генерацию qwen3:8b (~8 с).
+    reply_wait_s: float = Field(default=30.0, ge=0.0)
     # inprocess — MCP-сервер в том же процессе (быстрее, один индекс в памяти);
     # stdio — отдельным процессом, как настоящий внешний MCP-сервер.
     mcp_transport: Literal["inprocess", "stdio"] = "inprocess"

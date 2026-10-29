@@ -225,3 +225,4 @@ data/runs/*
 data/*.db
 data/chroma/
 models/
+data/uploads/

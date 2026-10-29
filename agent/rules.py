@@ -235,13 +235,20 @@ def stage_flags(text: str, stage: Stage) -> list[RuleHit]:
 
 
 def warning_text(hits: list[RuleHit]) -> str:
-    """Текст плашки: «Мошенник требует: «…»…», цитаты без повторов. Пусто, если срабатываний нет."""
+    """Текст плашки: «Признак развода: <категории> — «…»…», без повторов. Пусто, если срабатываний нет.
+
+    Категория идёт первой: не каждое срабатывание — требование («резервный счёт застрахован»,
+    «никому не говорите»), а человеку на плашке важнее понять, что это за признак.
+    """
+    labels: list[str] = []
     quotes: list[str] = []
     for h in hits:
         q = h.quote.strip()
+        if h.label not in labels:
+            labels.append(h.label)
         if q not in quotes:
             quotes.append(q)
     if not quotes:
         return ""
     joined = "; ".join(f"«{q}»" for q in quotes)
-    return f"Мошенник требует: {joined}. Ничего не называй и не переводи."
+    return f"Признак развода: {', '.join(labels)} — {joined}. Ничего не называй и не переводи."

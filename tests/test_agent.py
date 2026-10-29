@@ -9,6 +9,7 @@ import pytest
 from agent.config import Settings
 from agent.graph import AgentDeps
 from agent.llm import LLMError, generate_structured
+from agent.policy import HANGUP_DEFAULT
 from agent.prompts import BAIT_MODE, PROVOKE_MODE, Analysis, CallSummary, analysis_messages
 from agent.run import run_call
 from contracts import AgentEvent, AudioSource, CallCase, CallRequest, EventType, Speaker, Utterance
@@ -120,9 +121,13 @@ async def test_fraud_call_end_to_end(tmp_path: Path) -> None:
     stages = [e.payload["stage_n"] for e in events if e.type == EventType.stage_changed]
     assert stages == [3, 2, 3]
 
-    # The warning quotes what the caller really demanded, once, after the scheme is declared.
-    warnings = [e.payload["text"] for e in events[events.index(detected[0]) :] if e.type == EventType.warning]
-    assert len(warnings) == 1 and TRANSFER in warnings[0]
+    # The transfer demand is flagged by the rules without the LLM, before the scheme is declared,
+    # and the LLM path does not repeat it with a second banner.
+    warnings = [e for e in events if e.type == EventType.warning]
+    transfer = [w for w in warnings if "перевести на защищённый резервный счёт" in w.payload["text"]]
+    assert len(transfer) == 1
+    assert transfer[0].payload["text"].startswith("Признак развода")
+    assert events.index(transfer[0]) < events.index(detected[0])
 
     # Replies to the scammer: generated only after declaration, creative temperature, no repeats.
     suggestions = [e.payload for e in events if e.type == EventType.suggestion]
@@ -132,10 +137,13 @@ async def test_fraud_call_end_to_end(tmp_path: Path) -> None:
     # The safe way out is offered by code once the scheme is declared, and its text matches
     # the scheme category (safe-account is a bank scheme). The model reply is generated in the
     # background now, so the way out comes first, right after the analysis, not after the reply.
+    # Before that, the first rule hit already offered a general way out, without waiting for the model.
     hangups = [s for s in suggestions if s["kind"] == "hangup"]
-    assert hangups == [{"text": "Положите трубку и перезвоните в банк по номеру с обратной стороны карты.",
-                        "kind": "hangup"}]
-    assert suggestions.index(hangups[0]) == 0
+    assert hangups == [
+        {"text": HANGUP_DEFAULT, "kind": "hangup"},
+        {"text": "Положите трубку и перезвоните в банк по номеру с обратной стороны карты.", "kind": "hangup"},
+    ]
+    assert suggestions[0] == hangups[0]
     replies = reply_prompts(llm)
     temperatures = {t for p, t in zip(llm.prompts, llm.temperatures, strict=True) if p in replies}
     assert replies and temperatures == {harness.settings.reply_temperature}

@@ -100,8 +100,9 @@ async def test_finish_waits_for_background_reply(tmp_path: Path) -> None:
     events = harness.events()
     types = [e.type for e in events]
     kinds = [e.payload["kind"] for e in events if e.type == EventType.suggestion]
-    # The way out is published with the analysis; the slow reply arrives later, but before the report.
-    assert kinds == ["hangup", "provoke"]
+    # The way out is published at once: first the general one from the rules (the line demands a
+    # transfer), then the scheme-specific one with the analysis; the slow reply comes later, before the report.
+    assert kinds == ["hangup", "hangup", "provoke"]
     reply = next(e for e in events if e.type == EventType.suggestion and e.payload["text"] == DEFAULT_REPLY.text)
     assert events.index(reply) < types.index(EventType.summary)
 
@@ -115,7 +116,7 @@ async def test_finish_gives_up_on_a_hanging_reply(tmp_path: Path) -> None:
 
     # The case is saved without the late reply instead of keeping the call open for 5 s.
     kinds = [e.payload["kind"] for e in harness.events() if e.type == EventType.suggestion]
-    assert kinds == ["hangup"]
+    assert kinds == ["hangup", "hangup"]  # rules + analysis; no reply
     assert case.scheme_id == "safe-account"
     assert harness.storage.list_recent_cases()[0].call_id == "call-hang"
 

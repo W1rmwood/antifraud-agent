@@ -37,7 +37,8 @@ from langgraph.graph.state import CompiledStateGraph
 from agent.config import Settings
 from agent.events import EventSink
 from agent.llm import LLM, LLMError, Messages
-from agent.policy import decide, hangup_text, provoke_mode, quote_is_said
+from agent.policy import HANGUP_DEFAULT, decide, hangup_text, provoke_mode, quote_is_said
+from agent.rules import instant_flags, warning_text
 from agent.prompts import TACTIC_KIND, Analysis, CallSummary, Reply, analysis_messages, reply_messages, summary_messages
 from agent.tools import ToolClient
 from contracts import AudioSource, CallCase, EventType, NumberInfo, Scheme, Speaker, Utterance
@@ -97,6 +98,8 @@ class CallState:
     max_stage: int | None = None  # самый дальний этап за звонок; уходит в CallCase
     flags: list[str] = field(default_factory=list)  # подтверждённые требования мошенника после объявления схемы
     offer_hangup: bool = False  # на этом ходу показать подсказку «закончить разговор»
+    rule_quotes: list[str] = field(default_factory=list)  # фразы, на которые уже сработали правила без LLM
+    rule_hangup_sent: bool = False  # общая подсказка hangup от правил уже показана
     suggestions: list[str] = field(default_factory=list)  # отправленные подсказки: модели — чтобы не повторялась
 
 
@@ -154,9 +157,27 @@ class CallAgent:
         await self.wait_reply()
 
     async def record(self, utterance: Utterance) -> None:
-        """Добавляет фразу в транскрипт и сразу показывает её в UI, не дожидаясь модели."""
-        self.state.transcript.append(utterance)
+        """Добавляет фразу в транскрипт и сразу показывает её в UI, не дожидаясь модели.
+
+        Слова звонящего здесь же проверяются правилами без LLM (agent.rules): красная плашка
+        появляется через доли секунды после фразы, а не после разбора моделью (ТЗ:
+        «предупреждения не зависят от LLM»).
+        """
+        call = self.state
+        call.transcript.append(utterance)
         await self._sink.emit(EventType.transcript, utterance.model_dump(mode="json"))
+        if utterance.speaker == Speaker.user:
+            return
+        hits = [h for h in instant_flags(utterance.text) if h.quote not in call.rule_quotes]
+        if not hits:
+            return
+        call.rule_quotes += [h.quote for h in hits]
+        await self._sink.emit(EventType.warning, {"text": warning_text(hits)})
+        if not call.rule_hangup_sent and call.scheme is None:
+            # Схема ещё не определена, но звонящий уже чего-то требует: безопасный выход
+            # показываем сразу, общим текстом. После объявления схемы его заменит текст по её категории.
+            call.rule_hangup_sent = True
+            await self._sink.emit(EventType.suggestion, {"text": HANGUP_DEFAULT, "kind": "hangup"})
 
     async def analyze(self, batch_size: int = 1) -> Turn:
         """Один ход: граф по окну последних реплик, подсказка hangup и запуск фоновой реплики модели.
@@ -317,7 +338,11 @@ class CallAgent:
         await self._update_stage(decision.stage_n)
         # Предупреждение собирает код из подтверждённой цитаты, а не пишет модель:
         # так в нём не может оказаться того, чего мошенник не говорил.
-        new_flags = [f for f in decision.flags if f not in call.flags]
+        # Требование, о котором уже предупредили правила без LLM, второй плашкой не дублируем.
+        new_flags = [
+            f for f in decision.flags
+            if f not in call.flags and not any(quote_is_said(f, q) for q in call.rule_quotes)
+        ]
         if new_flags:
             call.flags += new_flags
             # Мошенник выдвинул новое требование (код, перевод, наличные) — снова напоминаем про выход.

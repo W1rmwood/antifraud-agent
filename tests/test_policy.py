@@ -159,3 +159,38 @@ def test_hangup_text_depends_on_category(category: str, phrase: str) -> None:
 )
 def test_provoke_only_in_second_half(stage_n: int | None, n_stages: int, provoke: bool) -> None:
     assert provoke_mode(stage_n, n_stages) is provoke
+
+
+# --- общая метка «мошенничество, схема не определена» ---
+
+GENERIC = "unknown-fraud"
+
+
+def test_generic_fraud_when_demand_is_said_but_no_scheme_fits() -> None:
+    # Модель не нашла подходящей схемы, но звонящий требует код, и правила тоже сработали.
+    decision = decide(analysis(scheme_id=None, stage_n=None, confidence=0.3), CALLER, CANDIDATES,
+                      threshold=0.6, rule_hit=True)
+    assert (decision.scheme_id, decision.stage_n) == (GENERIC, 3)
+    assert decision.flags == ["продиктуйте мне код из сообщения"]
+
+
+@pytest.mark.parametrize("result, rule_hit", [
+    (analysis(scheme_id=None, stage_n=None, confidence=0.3), False),  # правила молчат — одного признака мало
+    (analysis(scheme_id=None, stage_n=None, confidence=0.3, flags=[]), True),  # модель требования не нашла
+    (analysis(scheme_id=None, stage_n=None, flags=["переведите деньги на безопасный счёт"]), True),  # не прозвучало
+])
+def test_no_generic_fraud_without_both_signals(result: Analysis, rule_hit: bool) -> None:
+    assert not decide(result, CALLER, CANDIDATES, threshold=0.6, rule_hit=rule_hit).declared
+
+
+def test_generic_fraud_does_not_replace_a_declared_scheme() -> None:
+    decision = decide(analysis(scheme_id=None, stage_n=None, confidence=0.3), CALLER, CANDIDATES,
+                      threshold=0.6, current="safe-account", current_stage=2, rule_hit=True)
+    assert (decision.scheme_id, decision.stage_n) == ("safe-account", 2)
+
+
+def test_known_scheme_replaces_generic_at_once() -> None:
+    # Без «двух побед подряд»: общая метка только ждала, пока найдётся настоящая схема.
+    decision = decide(analysis(confidence=0.7), CALLER, CANDIDATES, threshold=0.6,
+                      current=GENERIC, current_stage=3, rule_hit=True)
+    assert decision.scheme_id == "bank-security-service" and decision.challenger is None

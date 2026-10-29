@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 from agent.prompts import Analysis
 from contracts import Scheme
-from rag.chunks import tokenize
+from rag.chunks import GENERIC_SCHEME_ID, tokenize
 
 QUOTE_OVERLAP = 0.7  # какая доля слов цитаты должна встретиться в речи звонящего
 
@@ -29,6 +29,7 @@ def quote_is_said(quote: str, caller_text: str) -> bool:
 
 
 SWITCH_MARGIN = 0.15  # ТЗ, «Поведение агента»: на сколько новая схема должна быть увереннее текущей
+GENERIC_STAGE = 3  # этап общей метки «Требование: деньги, код или данные» — с него она и ставится
 
 
 @dataclass(frozen=True)
@@ -58,12 +59,14 @@ def decide(
     current_confidence: float | None = None,
     challenger: str | None = None,
     margin: float = SWITCH_MARGIN,
+    rule_hit: bool = False,
 ) -> Decision:
     """Решает по ответу модели, объявлять ли схему.
 
     `candidates` — схемы, которые нашёл поиск; `current`, `current_stage` и
     `current_confidence` — уже объявленные схема, этап и уверенность в ней;
-    `challenger` — схема, которая обошла объявленную на прошлом ходу.
+    `challenger` — схема, которая обошла объявленную на прошлом ходу;
+    `rule_hit` — в звонке уже сработали правила без LLM (agent.rules).
     """
     # Оставляем только флаги, которые звонящий правда произнёс.
     flags = [q for q in analysis.hard_red_flags if quote_is_said(q, caller_text)]
@@ -82,10 +85,17 @@ def decide(
         and bool(flags)
     )
     if not qualifies:
+        if current is None and flags and rule_hit:
+            # Мошенник уже требует (код, перевод, данные карты), а известная схема не подошла:
+            # ставим общую метку «мошенничество, схема не определена», а не молчим.
+            # Нужны оба независимых признака — дословное требование от модели и правила по
+            # ключевым словам: по одному из них на обычном звонке (банк, курьер) легко ошибиться.
+            return Decision(GENERIC_SCHEME_ID, GENERIC_STAGE, flags)
         # Неуверенный ответ не объявляет новую схему, но и не снимает уже объявленную:
         # одна неудачная реплика не должна сбрасывать тревогу.
         return kept
-    if current is None:
+    if current is None or current == GENERIC_SCHEME_ID:
+        # С общей метки на известную схему переходим сразу: она только ждала, пока схема найдётся.
         return Decision(analysis.scheme_id, analysis.stage_n, flags)
 
     # Смена уже объявленной схемы (ТЗ, «Устойчивость»): только если новая увереннее

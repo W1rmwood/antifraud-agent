@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from rag.chunks import Chunk, load_schemes, scheme_chunks, tokenize
+from rag.chunks import GENERIC_SCHEME_ID, Chunk, load_schemes, scheme_chunks, tokenize
 from rag.index import build_index
 from rag.retriever import Retriever, open_index, rrf
 from tests.fakes.fake_embedder import FakeEmbedder
@@ -40,7 +40,10 @@ class ReverseReranker:
 
 def test_one_chunk_per_stage(chunks: list[Chunk]) -> None:
     schemes = load_schemes(SCHEMES_DIR)
-    assert len(chunks) == sum(len(s.stages) for s in schemes.values())
+    # Общая метка «схема не определена» в поиск не идёт: она перехватывала бы совпадения.
+    assert GENERIC_SCHEME_ID in schemes
+    assert not any(c.scheme_id == GENERIC_SCHEME_ID for c in chunks)
+    assert len(chunks) == sum(len(s.stages) for s in schemes.values() if s.id != GENERIC_SCHEME_ID)
     assert len({c.id for c in chunks}) == len(chunks)
     chunk = next(c for c in chunks if c.id == "gosuslugi#2")
     assert chunk.metadata() == {"scheme_id": "gosuslugi", "stage_n": 2, "category": "gosuslugi"}

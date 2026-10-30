@@ -2,6 +2,7 @@
 are analyzed as one batch, the model reply is generated in the background, one at a time."""
 
 import asyncio
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -91,34 +92,48 @@ async def test_busy_llm_analyzes_a_batch_on_a_fresh_window(tmp_path: Path) -> No
     assert agent.turns[-1].seq == len(FRAUD_LINES) - 1
 
 
-async def test_finish_waits_for_background_reply(tmp_path: Path) -> None:
-    llm = SlowLLM(safe_account_rule, reply_s=0.3)
+async def test_reply_that_finishes_in_time_is_shown(tmp_path: Path) -> None:
+    llm = SlowLLM(safe_account_rule, reply_s=0.05)
     harness = Harness(tmp_path, llm)
 
-    await harness.run("call-reply", FakeListener(FRAUD_LINES[:1]), phone=None)
+    await harness.run("call-reply", FakeListener(FRAUD_LINES[:2], delay_s=0.3), phone=None)
 
-    events = harness.events()
-    types = [e.type for e in events]
-    kinds = [e.payload["kind"] for e in events if e.type == EventType.suggestion]
-    # The way out is published at once: first the general one from the rules (the line demands a
-    # transfer), then the scheme-specific one with the analysis; the slow reply comes later, before the report.
-    assert kinds == ["hangup", "hangup", "provoke"]
-    reply = next(e for e in events if e.type == EventType.suggestion and e.payload["text"] == DEFAULT_REPLY.text)
-    assert events.index(reply) < types.index(EventType.summary)
+    kinds = [e.payload["kind"] for e in harness.events() if e.type == EventType.suggestion]
+    # The way out comes at once (rules, then the scheme), the model reply right after the analysis.
+    assert kinds[:2] == ["hangup", "hangup"] and "provoke" in kinds
 
 
-async def test_finish_gives_up_on_a_hanging_reply(tmp_path: Path) -> None:
+async def test_no_suggestions_after_the_call_ended(tmp_path: Path) -> None:
     llm = SlowLLM(safe_account_rule, reply_s=5.0)
     harness = Harness(tmp_path, llm)
-    harness.deps.settings = harness.settings.model_copy(update={"reply_wait_s": 0.1})
+    started = time.monotonic()
 
     case = await harness.run("call-hang", FakeListener(FRAUD_LINES[:1]), phone=None)
 
-    # The case is saved without the late reply instead of keeping the call open for 5 s.
-    kinds = [e.payload["kind"] for e in harness.events() if e.type == EventType.suggestion]
-    assert kinds == ["hangup", "hangup"]  # rules + analysis; no reply
+    # The unfinished reply is cancelled, not awaited: no hint after the conversation is over,
+    # and «Стоп» saves the case at once instead of waiting for the model.
+    events = harness.events()
+    kinds = [e.payload["kind"] for e in events if e.type == EventType.suggestion]
+    assert kinds == ["hangup", "hangup"]  # rules + analysis; the reply was cancelled
+    assert time.monotonic() - started < 2
+    assert events[-1].type == EventType.call_ended
     assert case.scheme_id == "safe-account"
     assert harness.storage.list_recent_cases()[0].call_id == "call-hang"
+
+
+async def test_new_batch_cancels_a_stale_reply(tmp_path: Path) -> None:
+    # Phrases come faster than the model writes a reply: each new batch cancels the reply to the
+    # old window, so the analysis never waits behind it (Ollama serves one request at a time).
+    llm = SlowLLM(safe_account_rule, analysis_s=0.02, reply_s=1.0)
+    harness = Harness(tmp_path, llm)
+    started = time.monotonic()
+
+    await harness.run("call-fast", FakeListener(FRAUD_LINES, delay_s=0.15), phone=None)
+
+    kinds = [e.payload["kind"] for e in harness.events() if e.type == EventType.suggestion]
+    assert "provoke" not in kinds  # every reply was outdated by the next phrase
+    assert llm.max_replying == 1
+    assert time.monotonic() - started < 3  # no 1-second reply waited for on any turn
 
 
 async def test_one_reply_generation_at_a_time(tmp_path: Path) -> None:
@@ -127,12 +142,10 @@ async def test_one_reply_generation_at_a_time(tmp_path: Path) -> None:
 
     await harness.run("call-single", FakeListener(FRAUD_LINES, delay_s=0.05), phone=None)
 
-    # Analyses are fast, so every utterance gets one, but a reply is started only
-    # when the previous one is done.
-    replies = [p for p in llm.prompts if p.startswith("Развод:")]
+    # Analyses are fast, so every utterance gets one; a new analysis cancels the reply to the
+    # previous window, so there is never more than one reply in flight.
     assert len(analysis_prompts(llm)) == len(FRAUD_LINES)
     assert llm.max_replying == 1
-    assert 1 <= len(replies) < len(FRAUD_LINES)
 
 
 async def test_audio_failure_still_saves_the_case(tmp_path: Path) -> None:

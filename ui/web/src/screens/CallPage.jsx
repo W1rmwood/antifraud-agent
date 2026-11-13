@@ -5,9 +5,9 @@ import { AgentLog, Hint, Scheme, Signs, Verdict } from '../components/AgentPanel
 import CallTimeline from '../components/CallTimeline.jsx'
 import Transcript from '../components/Transcript.jsx'
 import { clock, phone as fmtPhone, plural } from '../format.js'
-import { Alert, File, Mic, Play, Speaker, Stop } from '../icons.jsx'
+import { Alert, File, Mic, Phone, Play, Speaker, Stop } from '../icons.jsx'
 import { diagnose } from '../diagnose.js'
-import Report from './Report.jsx'
+import Report, { sourceLabel } from './Report.jsx'
 
 function useNow(active) {
   const [now, setNow] = useState(Date.now())
@@ -22,9 +22,8 @@ function useNow(active) {
 function SourceChip({ source, replay }) {
   if (replay) return <span className="chip"><Play size={12} />запись, без модели</span>
   if (!source) return null
-  const Icon = { file: File, mic: Mic, loopback: Speaker }[source.kind] || File
-  const label = source.kind === 'file' ? source.path.split('/').pop() : source.kind === 'mic' ? 'микрофон' : 'звук компьютера'
-  return <span className="chip"><Icon size={12} />{label}</span>
+  const Icon = { file: File, mic: Mic, loopback: Speaker, remote: Phone }[source.kind] || File
+  return <span className="chip"><Icon size={12} />{sourceLabel(source)}</span>
 }
 
 /** Экран звонка: идёт сейчас, закончился или открыт из истории — одни и те же события. */

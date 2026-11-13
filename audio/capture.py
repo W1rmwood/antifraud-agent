@@ -131,3 +131,75 @@ async def open_capture(source, block_ms: int = BLOCK_MS):
     finally:
         stream.stop()
         stream.close()
+
+
+# ---------------------------------------------------------------- звук от телефона (remote)
+
+READ_BYTES = 64 * 1024  # сколько читать из потока за раз; блоки нарезаются уже из прочитанного
+
+
+async def open_remote(source=None, stream=None, block_ms: int = BLOCK_MS):
+    """Асинхронный поток блоков float32 моно 16 кГц из потока байт PCM s16le (по умолчанию stdin).
+
+    Так агент получает звук от телефона: ui/server.py пишет присланные куски в stdin процесса
+    (docs/ios/architecture.md). Блоки — по block_ms, как у микрофона; конец потока — конец
+    генератора, последний неполный блок тоже отдаётся. Нечётный хвост байт (половина отсчёта)
+    ждёт следующего чтения.
+
+    Чтение блокирующее, поэтому идёт в отдельном потоке-демоне, а блоки попадают в asyncio.Queue
+    через loop.call_soon_threadsafe — как у колбэка sounddevice. Не пул потоков: поток, который
+    висит в read() на открытом stdin, не должен держать выход из asyncio.run и процесса.
+    """
+    import asyncio
+    import sys
+    import threading
+
+    if stream is None:
+        stream = sys.stdin.buffer
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    closed = threading.Event()
+    read = getattr(stream, "read1", None) or stream.read  # read1 отдаёт, что уже пришло, не дожидаясь READ_BYTES
+
+    def put(item) -> None:
+        try:
+            loop.call_soon_threadsafe(queue.put_nowait, item)
+        except RuntimeError:  # event loop уже закрыт — звонок кончился, звук никому не нужен
+            pass
+
+    def reader() -> None:
+        try:
+            while not closed.is_set():
+                data = read(READ_BYTES)
+                if not data:
+                    break
+                put(bytes(data))
+        except BaseException as e:  # ошибку чтения отдаём потребителю, а не теряем в потоке
+            put(e)
+        finally:
+            put(None)
+
+    threading.Thread(target=reader, name="remote-audio", daemon=True).start()
+    block_bytes = int(SAMPLE_RATE * block_ms / 1000) * 2
+    pending = bytearray()
+
+    def samples(raw: bytes | bytearray) -> np.ndarray:
+        return (np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0).astype(np.float32)
+
+    try:
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            pending += item
+            while len(pending) >= block_bytes:
+                yield samples(pending[:block_bytes])
+                del pending[:block_bytes]
+        # Конец потока: остаток короче блока — тоже звук; непарный последний байт отбрасываем.
+        tail = len(pending) - len(pending) % 2
+        if tail:
+            yield samples(pending[:tail])
+    finally:
+        closed.set()

@@ -1,27 +1,38 @@
 """Веб-интерфейс «Антимошенника»: HTTP-мост между браузером и agent/ui_api.py.
 
     .venv/bin/python -m ui.server [--port 8642]     # потом открыть http://127.0.0.1:8642
+    .venv/bin/python -m ui.server --host 0.0.0.0    # ещё и для телефона в той же сети (docs/ios/architecture.md)
 
 Браузер не умеет запускать процессы и читать data/runs/, поэтому мост делает ровно
 то, что в docs/frontend.md делает Streamlit: start_call / start_replay / stop и хвост
 лога событий. События уходят в браузер как есть (контракт №3) через Server-Sent Events,
 экран собирает из них состояние сам (ui/web/src/callView.js повторяет call_view).
 
-Только стандартная библиотека: зависимости проекта не меняются. Слушает 127.0.0.1 —
-интерфейс локальный, как и весь агент. Собранный фронт берётся из ui/web/dist
+Только стандартная библиотека: зависимости проекта не меняются. По умолчанию слушает
+127.0.0.1 — интерфейс локальный, как и весь агент. С `--host 0.0.0.0` к нему подключается
+приложение на iPhone: шлёт звук (`source: "remote"`, POST …/audio) и читает те же события.
+Запросы не с этого компьютера проходят только с кодом доступа (`Authorization: Bearer`),
+веб-интерфейс на самом компьютере работает без кода. Собранный фронт берётся из ui/web/dist
 (`npm run build` в ui/web); при разработке его отдаёт `npm run dev` с прокси на этот порт.
 """
 
 import argparse
+import hmac
 import importlib.util
+import ipaddress
 import json
 import os
 import re
+import secrets
+import shutil
+import signal
+import socket
 import sqlite3
+import subprocess
 import threading
 import time
 import urllib.request
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -42,6 +53,16 @@ UPLOAD_TYPES = {".wav", ".flac", ".ogg", ".mp3", ".txt"}  # что читает 
 UPLOAD_MAX_BYTES = 300 * 1024 * 1024
 NO_DB = "База кейсов ещё не создана: .venv/bin/python -m storage.seed_demo (или проведите первый звонок)"
 
+# Телефон (docs/ios/architecture.md, «API для телефона»).
+API_VERSION = 1  # GET /api/info: по нему приложение понимает, что говорит с нашим сервером
+AUDIO_MAX_BYTES = 1024 * 1024  # один кусок PCM; телефон шлёт по 250 мс = 8000 байт
+DRAIN_MAX_BYTES = 8 * 1024 * 1024  # тело отклонённого запроса дочитываем, чтобы клиент получил ответ, а не обрыв
+SILENCE_TIMEOUT_S = 90.0  # столько без звука от телефона — звонок заканчивается, как по «Стоп»
+WATCHDOG_POLL_S = 1.0  # как часто сторож тишины проверяет звонки
+TOKEN_ENV = "ANTIFRAUD_TOKEN"  # код доступа для запросов не с этого компьютера; нет — создаётся при запуске
+BONJOUR_NAME = "Антимошенник"
+BONJOUR_TYPE = "_antifraud._tcp"
+
 # Записанные звонки для режима «Запись (без модели)»: путь от корня проекта → подпись.
 RECORDS: dict[str, str] = {
     "data/runs/demo.jsonl": "Демо для защиты: «мама, я попал в аварию»",
@@ -52,14 +73,25 @@ RECORDS: dict[str, str] = {
 }
 
 
+@dataclass
+class _Feed:
+    """Приём звука одного remote-звонка: последний записанный seq и когда телефон слышали."""
+
+    last_seq: int = -1
+    heard: float = field(default_factory=time.monotonic)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
 class Calls:
     """Звонки, запущенные этим сервером. Модель одна, поэтому идёт не больше одного звонка."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._calls: dict[str, CallProcess] = {}
-        self._sources: dict[str, str] = {}  # call_id → file / mic / loopback / replay
+        self._sources: dict[str, str] = {}  # call_id → file / mic / loopback / remote / replay
         self._stopping: set[str] = set()
+        self._feeds: dict[str, _Feed] = {}  # только remote-звонки
+        self._watchdog: threading.Thread | None = None
 
     def get(self, call_id: str) -> CallProcess | None:
         return self._calls.get(call_id)
@@ -85,23 +117,63 @@ class Calls:
                     raise ValueError("нет такого файла: выберите тестовый звонок или загрузите запись")
                 phone = _phone(body.get("phone")) or (chosen.phone if chosen else None)
                 call = ui_api.start_call(source="file", path=path, phone=phone, realtime=bool(body.get("realtime", True)))
-            elif source in ("mic", "loopback"):
+            elif source in ("mic", "loopback", "remote"):
                 call = ui_api.start_call(source=source, phone=_phone(body.get("phone")))
             else:
-                raise ValueError("source: file, mic, loopback или replay")
+                raise ValueError("source: file, mic, loopback, remote или replay")
             self._calls[call.call_id] = call
             self._sources[call.call_id] = source
+            if source == "remote":
+                self._feeds[call.call_id] = _Feed()
+                if self._watchdog is None:
+                    self._watchdog = threading.Thread(target=self._watch_silence, name="silence-watchdog", daemon=True)
+                    self._watchdog.start()
             return call
 
     def stop(self, call: CallProcess) -> None:
         """«Стоп» ждёт до 45 с, пока агент допишет отчёт, — поэтому в отдельном потоке."""
-        if call.call_id in self._stopping:
-            return
-        self._stopping.add(call.call_id)
+        with self._lock:
+            if call.call_id in self._stopping:
+                return
+            self._stopping.add(call.call_id)
         threading.Thread(target=call.stop, daemon=True).start()
 
     def source(self, call_id: str) -> str | None:
         return self._sources.get(call_id)
+
+    def accepts_audio(self, call: CallProcess) -> bool:
+        """Звонок remote, идёт и «Стоп» ещё не нажимали — звук от телефона ещё нужен."""
+        return call.call_id in self._feeds and call.running and call.call_id not in self._stopping
+
+    def feed(self, call: CallProcess, seq: int, data: bytes) -> bool:
+        """Кусок звука от телефона → stdin агента. False — повтор уже принятого seq, звук не пишется.
+
+        RuntimeError — звонок закончился, пока шёл запрос (мост отвечает 409).
+        """
+        feed = self._feeds[call.call_id]
+        with feed.lock:  # повтор и запись — атомарно: два запроса с одним seq не запишут звук дважды
+            feed.heard = time.monotonic()
+            if seq <= feed.last_seq:
+                return False
+            call.feed(data)
+            feed.last_seq = seq
+            return True
+
+    def _watch_silence(self) -> None:
+        """Сторож тишины: телефон пропал (SILENCE_TIMEOUT_S без звука) — звонок заканчивается, как по «Стоп».
+
+        Поток живёт, пока идут remote-звонки, и запускается заново со следующим.
+        """
+        while True:
+            time.sleep(WATCHDOG_POLL_S)
+            with self._lock:
+                live = [(self._calls[cid], feed) for cid, feed in self._feeds.items() if self._calls[cid].running]
+                if not live:
+                    self._watchdog = None
+                    return
+            for call, feed in live:
+                if call.call_id not in self._stopping and time.monotonic() - feed.heard > SILENCE_TIMEOUT_S:
+                    self.stop(call)
 
     def status(self, call: CallProcess) -> dict[str, Any]:
         running = call.running
@@ -129,6 +201,7 @@ def _json(value: Any) -> Any:
 
 class Handler(BaseHTTPRequestHandler):
     calls: Calls  # задаётся в make_server
+    token: str  # код доступа для запросов не с этого компьютера; задаётся в make_server
     server_version = "antifraud-ui"
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 — так зовётся параметр в базовом классе
@@ -140,9 +213,13 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         parts = [unquote(p) for p in url.path.strip("/").split("/") if p]
         query = parse_qs(url.query)
+        if not self._authorized(parts):
+            return self._error(401, "нужен код доступа: заголовок Authorization: Bearer <код>")
         if parts[:1] != ["api"]:
             return self._static(url.path)
         match parts[1:]:
+            case ["info"]:
+                self._send(200, {"app": "antifraud", "api": API_VERSION, "auth": True})
             case ["sources"]:
                 busy = self.calls.running()
                 self._send(200, {
@@ -182,8 +259,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._error(404, "нет такого адреса")
 
     def do_POST(self) -> None:  # noqa: N802
-        parts = [p for p in urlparse(self.path).path.strip("/").split("/") if p]
-        length = int(self.headers.get("Content-Length") or 0)
+        url = urlparse(self.path)
+        parts = [p for p in url.path.strip("/").split("/") if p]
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length < 0:
+            self.close_connection = True
+            return self._error(400, "неверный Content-Length")
+        if not self._authorized(parts):
+            self._discard(length)
+            return self._error(401, "нужен код доступа: заголовок Authorization: Bearer <код>")
+        if len(parts) == 4 and parts[:2] == ["api", "calls"] and parts[3] == "audio":
+            return self._audio(parts[2], parse_qs(url.query), length)
         if parts == ["api", "upload"] and length > UPLOAD_MAX_BYTES:
             return self._error(413, f"файл больше {UPLOAD_MAX_BYTES // 1024 // 1024} МБ")
         body_bytes = self.rfile.read(length)
@@ -215,6 +304,60 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(202, self.calls.status(call))
             case _:
                 self._error(404, "нет такого адреса")
+
+    # --- телефон: доступ и звук ---
+
+    def _authorized(self, parts: list[str]) -> bool:
+        """С этого компьютера — без кода; остальным всё, кроме /api/info, — с Authorization: Bearer <код>."""
+        if _is_loopback(self.client_address[0]) or parts == ["api", "info"]:
+            return True
+        header = self.headers.get("Authorization") or ""
+        scheme, _, code = header.partition(" ")
+        if scheme.lower() != "bearer" or not code.strip() or not self.token:
+            return False
+        return hmac.compare_digest(code.strip().encode(), self.token.encode())
+
+    def _audio(self, call_id: str, query: dict[str, list[str]], length: int) -> None:
+        """POST /api/calls/<id>/audio?seq=N — кусок PCM s16le 16 кГц моно от телефона в stdin агента.
+
+        Повтор (seq не больше уже принятого) — 204 без записи: телефон переслал кусок после обрыва сети.
+        """
+        call = self.calls.get(call_id)
+        if call is None:
+            self._discard(length)
+            return self._error(404, "звонок не найден")
+        if not self.calls.accepts_audio(call):
+            self._discard(length)
+            reason = "звонок не принимает звук: источник не remote" if self.calls.source(call_id) != "remote" \
+                else "звонок уже закончился"
+            return self._error(409, reason)
+        raw_seq = query.get("seq", [""])[0]
+        if not raw_seq.isdigit():  # isdigit: не число и отрицательные — тоже 400
+            self._discard(length)
+            return self._error(400, "нужен seq — номер куска: 0, 1, 2, …")
+        if length > AUDIO_MAX_BYTES:
+            self._discard(length)
+            return self._error(413, f"кусок звука больше {AUDIO_MAX_BYTES // 1024 // 1024} МБ")
+        data = self.rfile.read(length)
+        if not data or len(data) % 2:
+            return self._error(400, "тело — PCM s16le: не пустое и чётное число байт")
+        try:
+            self.calls.feed(call, int(raw_seq), data)
+        except RuntimeError as exc:
+            return self._error(409, str(exc))
+        self._no_content()
+
+    def _discard(self, length: int) -> None:
+        """Дочитывает тело, которое не понадобилось: иначе сокет закроется с непрочитанными данными
+        и клиент вместо ответа (401, 404, 413…) получит обрыв соединения."""
+        if length > DRAIN_MAX_BYTES:
+            self.close_connection = True
+            return
+        while length > 0:
+            chunk = self.rfile.read(min(length, 64 * 1024))
+            if not chunk:
+                break
+            length -= len(chunk)
 
     # --- поток событий ---
 
@@ -292,6 +435,11 @@ class Handler(BaseHTTPRequestHandler):
     def _error(self, status: int, message: str) -> None:
         self._send(status, {"error": message})
 
+    def _no_content(self) -> None:
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _static(self, url_path: str) -> None:
         """Собранный фронт; неизвестный путь — index.html (экраны переключает сам фронт)."""
         if not (WEB_DIST / "index.html").exists():
@@ -325,6 +473,59 @@ _CONTENT_TYPES = {
     ".png": "image/png",
     ".ico": "image/x-icon",
 }
+
+
+def _is_loopback(address: str) -> bool:
+    """Запрос с этого же компьютера: 127.0.0.1, ::1 (и ::ffff:127.0.0.1, если сервер слушает IPv6)."""
+    try:
+        ip = ipaddress.ip_address(address.split("%")[0])
+    except ValueError:
+        return address == "localhost"
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback
+
+
+def _lan_addresses() -> list[str]:
+    """Адреса этого компьютера в локальной сети — их печатаем, чтобы ввести в телефон.
+
+    Без сторонних библиотек списка интерфейсов нет, поэтому спрашиваем систему, с какого адреса
+    она пошла бы к типичным адресам сети. UDP connect ничего не отправляет — только выбирает маршрут.
+    Сначала частные адреса (192.168…, 10…, 172.16–31…): VPN часто отдаёт свой адрес на 8.8.8.8.
+    """
+    found: list[str] = []
+    for target in ("192.168.0.1", "192.168.1.1", "10.0.0.1", "172.16.0.1", "8.8.8.8"):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect((target, 9))
+                found.append(s.getsockname()[0])
+        except OSError:
+            continue
+    try:
+        found += socket.gethostbyname_ex(socket.gethostname())[2]
+    except OSError:
+        pass
+    lan = [ipaddress.ip_network(n) for n in ("192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12")]
+    usable = [a for a in dict.fromkeys(found) if not ipaddress.ip_address(a).is_loopback and a != "0.0.0.0"]
+    usable.sort(key=lambda a: not any(ipaddress.ip_address(a) in net for net in lan))
+    return usable
+
+
+def _bonjour(port: int) -> subprocess.Popen[bytes] | None:
+    """Объявляет сервер в сети (Bonjour, _antifraud._tcp) через dns-sd — он есть на macOS.
+
+    Нет dns-sd (Linux, Windows) — молча без объявления: адрес в телефон вводится руками.
+    """
+    dns_sd = shutil.which("dns-sd")
+    if dns_sd is None:
+        return None
+    try:
+        return subprocess.Popen(
+            [dns_sd, "-R", BONJOUR_NAME, BONJOUR_TYPE, "local", str(port)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
 
 
 def _phone(raw: Any) -> str | None:
@@ -466,9 +667,21 @@ def _health() -> dict[str, Any]:
     return {"model_ready": model_ready, "checks": checks}
 
 
-def make_server(port: int = 8642, host: str = "127.0.0.1") -> ThreadingHTTPServer:
-    handler = type("BoundHandler", (Handler,), {"calls": Calls()})
-    server = ThreadingHTTPServer((host, port), handler)
+def _raise_interrupt(signum: int, frame: Any) -> None:
+    raise KeyboardInterrupt
+
+
+def new_token() -> str:
+    """Код доступа: из ANTIFRAUD_TOKEN, иначе случайные 6 цифр на этот запуск."""
+    return os.environ.get(TOKEN_ENV, "").strip() or f"{secrets.randbelow(10**6):06d}"
+
+
+def make_server(port: int = 8642, host: str = "127.0.0.1", token: str | None = None) -> ThreadingHTTPServer:
+    handler = type("BoundHandler", (Handler,), {"calls": Calls(), "token": token or new_token()})
+    server_class = ThreadingHTTPServer
+    if ":" in host:  # IPv6 (например, «::»): ThreadingHTTPServer по умолчанию только IPv4
+        server_class = type("ThreadingHTTPServerV6", (ThreadingHTTPServer,), {"address_family": socket.AF_INET6})
+    server = server_class((host, port), handler)
     server.daemon_threads = True  # открытые потоки событий не держат сервер при выходе
     return server
 
@@ -476,14 +689,33 @@ def make_server(port: int = 8642, host: str = "127.0.0.1") -> ThreadingHTTPServe
 def main() -> None:
     parser = argparse.ArgumentParser(description="Веб-интерфейс «Антимошенника».")
     parser.add_argument("--port", type=int, default=8642)
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="какой адрес слушать; 0.0.0.0 — ещё и локальную сеть (для телефона, с кодом доступа)")
     args = parser.parse_args()
-    server = make_server(args.port)
-    print(f"Антимошенник: http://127.0.0.1:{args.port}")
+    server = make_server(args.port, args.host)
+    port = server.server_address[1]
+    wildcard = args.host in ("0.0.0.0", "::")
+    local = "127.0.0.1" if wildcard or _is_loopback(args.host) else args.host
+    print(f"Антимошенник: http://{local}:{port}")
+    bonjour = None
+    if not _is_loopback(args.host):
+        token = server.RequestHandlerClass.token
+        lan = _lan_addresses() if wildcard else [args.host]
+        for address in lan[:1] or ["<адрес этого компьютера>"]:
+            print(f"Телефон: http://{address}:{port}, код {token}")
+        for address in lan[1:]:
+            print(f"         (или http://{address}:{port})")
+        bonjour = _bonjour(port)
+    # SIGTERM (kill, остановка из скрипта) — как Ctrl+C: иначе finally не выполнится,
+    # dns-sd останется висеть, а идущий звонок не допишет отчёт.
+    signal.signal(signal.SIGTERM, _raise_interrupt)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if bonjour is not None:
+            bonjour.terminate()
         # Идущий звонок останавливаем штатно: агент допишет отчёт и сохранит кейс.
         if (call := server.RequestHandlerClass.calls.running()) is not None:
             call.stop()

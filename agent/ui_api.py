@@ -19,8 +19,10 @@ UI (Streamlit, ui/app.py) не импортирует граф, LLM и звук:
 
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,6 +45,7 @@ RUNS_DIR = ROOT / "data" / "runs"
 CALLS_DIR = ROOT / "data" / "calls"
 SCHEMES_DIR = ROOT / "data" / "schemes"
 STOP_TIMEOUT_S = 45.0  # сколько ждать штатного конца после «Стоп»: доработка разбора, отчёт LLM, save_case
+TERM_TIMEOUT_S = 10.0  # remote: stdin закрыт, а штатного конца нет — после SIGTERM ждём ещё столько и kill
 
 
 # --- Запуск и остановка ---
@@ -56,6 +59,17 @@ class CallProcess:
     events_path: Path  # лог событий, который читает EventTail
     stderr_path: Path  # ошибки процесса: если звонок упал, причина здесь
     process: subprocess.Popen[bytes]
+    # Звук от телефона (source="remote"): куски PCM копятся здесь и пишутся в stdin отдельным
+    # потоком, чтобы запрос телефона не ждал, пока агент дочитает трубу (он ещё грузит модели).
+    _audio: queue.SimpleQueue[bytes | None] | None = field(default=None, repr=False)
+    _audio_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _audio_closed: bool = field(default=False, repr=False)
+    _audio_error: str = field(default="", repr=False)
+
+    def __post_init__(self) -> None:
+        if self.process.stdin is not None:
+            self._audio = queue.SimpleQueue()
+            threading.Thread(target=self._write_audio, name=f"audio-{self.call_id}", daemon=True).start()
 
     @property
     def running(self) -> bool:
@@ -66,8 +80,65 @@ class CallProcess:
         """None — ещё идёт; 0 — закончился штатно; иное — упал (см. stderr_path)."""
         return self.process.poll()
 
+    @property
+    def takes_audio(self) -> bool:
+        """Процесс читает звук из stdin (source="remote")."""
+        return self._audio is not None
+
+    def feed(self, data: bytes) -> None:
+        """Звук от телефона → stdin агента (PCM s16le 16 кГц моно). Можно звать из разных потоков.
+
+        Процесс уже закончился, stdin закрыт или запись в него сломалась — RuntimeError
+        (мост отвечает 409). ValueError — у звонка нет stdin (не remote).
+        """
+        if self._audio is None:
+            raise ValueError("звонок не принимает звук: источник не remote")
+        with self._audio_lock:
+            if self._audio_closed or not self.running or self._audio_error:
+                raise RuntimeError(self._audio_error or "звонок уже закончился")
+            if data:
+                self._audio.put(bytes(data))
+
+    def close_audio(self) -> None:
+        """Конец звука: stdin закрывается, когда допишется всё принятое, — агент дораспознаёт остаток."""
+        if self._audio is None:
+            return
+        with self._audio_lock:
+            if self._audio_closed:
+                return
+            self._audio_closed = True
+            self._audio.put(None)
+
+    def _write_audio(self) -> None:
+        """Поток-писатель: очередь кусков → stdin процесса; None — закрыть stdin."""
+        assert self._audio is not None and self.process.stdin is not None
+        stdin = self.process.stdin
+        while (data := self._audio.get()) is not None:
+            if self._audio_error:
+                continue  # труба уже сломана — остаток выбрасываем, ждём только None
+            try:
+                stdin.write(data)
+                stdin.flush()
+            except (BrokenPipeError, OSError, ValueError) as exc:  # процесс умер или stdin закрыт
+                self._audio_error = f"звонок уже закончился ({type(exc).__name__})"
+        try:
+            stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
     def stop(self, timeout_s: float = STOP_TIMEOUT_S) -> None:
-        """Кнопка «Стоп»: SIGTERM — агент дорабатывает, пишет отчёт и call_ended; не успел — kill."""
+        """Кнопка «Стоп»: агент дорабатывает, пишет отчёт и call_ended; не успел — kill.
+
+        Обычный звонок получает SIGTERM. remote — сначала конец stdin: агент дораспознаёт
+        присланный звук и заканчивает звонок сам; не уложился в timeout_s — SIGTERM, потом kill.
+        """
+        if self.takes_audio:
+            self.close_audio()
+            try:
+                self.process.wait(timeout=timeout_s)
+                return
+            except subprocess.TimeoutExpired:
+                timeout_s = TERM_TIMEOUT_S
         if not self.running:
             return
         self.process.terminate()
@@ -84,7 +155,8 @@ class CallProcess:
         return "\n".join(self.stderr_path.read_text(encoding="utf-8", errors="replace").splitlines()[-20:])
 
 
-def _spawn(args: list[str], call_id: str) -> CallProcess:
+def _spawn(args: list[str], call_id: str, audio_in: bool = False) -> CallProcess:
+    """Запускает `python -m <args>`; audio_in — stdin трубой для звука от телефона (иначе DEVNULL)."""
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     events_path = RUNS_DIR / f"{call_id}.jsonl"
     stderr_path = RUNS_DIR / f"{call_id}.stderr.log"
@@ -97,7 +169,8 @@ def _spawn(args: list[str], call_id: str) -> CallProcess:
     env = {**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "ANTIFRAUD_RUNS_DIR": str(RUNS_DIR)}
     with stderr_path.open("wb") as stderr:
         process = subprocess.Popen(
-            [sys.executable, "-m", *args], cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=stderr
+            [sys.executable, "-m", *args], cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=stderr,
+            stdin=subprocess.PIPE if audio_in else subprocess.DEVNULL,
         )
     return CallProcess(call_id, events_path, stderr_path, process)
 
@@ -107,7 +180,7 @@ def new_call_id() -> str:
 
 
 def start_call(
-    source: Literal["file", "mic", "loopback"] = "file",
+    source: Literal["file", "mic", "loopback", "remote"] = "file",
     path: str | None = None,
     phone: str | None = None,
     call_id: str | None = None,
@@ -116,7 +189,8 @@ def start_call(
     """Кнопка «Старт»: запускает агента командой контракта №7.
 
     `realtime` — для файла: реплики идут в темпе живого звонка (для демо — то, что нужно).
-    Для mic и loopback звонок идёт, пока не вызовут stop().
+    Для mic и loopback звонок идёт, пока не вызовут stop(). Для remote звук подаётся
+    через feed(), конец — close_audio() или stop().
     """
     call_id = call_id or new_call_id()
     args = ["agent.run", "--call-id", call_id, "--source", source, "--json"]
@@ -126,7 +200,7 @@ def start_call(
         args += ["--path", path] + (["--realtime"] if realtime else [])
     if phone:
         args += ["--phone", phone]
-    return _spawn(args, call_id)
+    return _spawn(args, call_id, audio_in=source == "remote")
 
 
 def start_replay(events_file: str | Path, call_id: str | None = None, speed: float = 1.0) -> CallProcess:

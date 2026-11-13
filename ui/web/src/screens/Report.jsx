@@ -38,10 +38,12 @@ function Scenario({ stages, reached }) {
   )
 }
 
-function sourceLabel(source, replay) {
+/** Откуда звук звонка — подпись для экрана звонка и отчёта. remote — микрофон телефона (приложение iPhone). */
+export function sourceLabel(source, replay) {
   if (replay) return 'запись, без модели'
   if (!source) return null
-  return source.kind === 'file' ? source.path.split('/').pop() : source.kind === 'mic' ? 'микрофон' : 'звук компьютера'
+  if (source.kind === 'file') return source.path.split('/').pop()
+  return { mic: 'микрофон', loopback: 'звук компьютера', remote: 'телефон' }[source.kind] || source.kind
 }
 
 /** Текст отчёта для буфера обмена: переслать родственникам или приложить к заявлению. */

@@ -5,6 +5,7 @@
     python -m agent.run data/calls/001.wav --phone +79990000001 [--realtime] [--json]
     python -m agent.run --mic        # живой звонок на громкой связи, Ctrl+C — закончить
     python -m agent.run --call-id c001 --source file --path data/calls/001.wav   # контракт №7, для UI
+    python -m agent.run --source remote < call.pcm   # звук от телефона: PCM s16le 16 кГц в stdin, EOF — конец
 
 Слух и разбор идут параллельно: фраза попадает на экран сразу после
 распознавания, а LLM разбирает то, что накопилось, пока она думала над
@@ -143,7 +144,8 @@ def default_mcp_target(settings: Settings, retriever: Retriever) -> McpTarget:
 async def until_stopped(utterances: AsyncIterator[Utterance], stop: asyncio.Event) -> AsyncIterator[Utterance]:
     """Пропускает реплики, пока не взведён `stop`; потом закрывает источник и заканчивается.
 
-    Живой звук (микрофон) сам не кончается: звонок завершают по Ctrl+C. Обрывать
+    Живой звук (микрофон) сам не кончается: звонок завершают по Ctrl+C. Звук от телефона
+    (remote) кончается сам — с концом stdin, и тогда звонок заканчивается так же штатно. Обрывать
     весь процесс нельзя — потеряется отчёт и кейс. Поэтому Ctrl+C только взводит
     событие, слушатель штатно заканчивается, и run_call доходит до finish().
     """
@@ -268,24 +270,21 @@ async def _main(
         printing.cancel()
 
 
-def main() -> None:
-    """Точка входа: `python -m agent.run <файл> | --mic | --loopback` или форма контракта №7 для UI.
-
-    Контракт №7 (её запускает кнопка «Старт»):
-        python -m agent.run --call-id c001 --source file --path data/calls/001.wav [--phone +7…] [--json]
-    """
+def parse_args(argv: list[str] | None = None) -> tuple[AudioSource, argparse.Namespace]:
+    """Разбор командной строки: откуда звук и остальные параметры звонка."""
     parser = argparse.ArgumentParser(description="Run the agent on one call and print what the user would see.")
     parser.add_argument("path", nargs="?", help="audio file or a .txt transcript ('caller: ...' lines)")
     live = parser.add_mutually_exclusive_group()
     live.add_argument("--mic", action="store_true", help="live call from the microphone (speakerphone); Ctrl+C ends it")
     live.add_argument("--loopback", action="store_true", help="live call from system audio (ANTIFRAUD_LOOPBACK_DEVICE)")
-    live.add_argument("--source", choices=["file", "mic", "loopback"], help="contract #7: where the sound comes from")
+    live.add_argument("--source", choices=["file", "mic", "loopback", "remote"],
+                      help="contract #7: where the sound comes from (remote: PCM s16le 16 kHz mono on stdin)")
     parser.add_argument("--path", dest="path_opt", help="contract #7: call file for --source file")
     parser.add_argument("--call-id", default=None, help="call id; events go to data/runs/<call-id>.jsonl")
     parser.add_argument("--phone", default=None, help="caller number, +7XXXXXXXXXX")
     parser.add_argument("--realtime", action="store_true", help="file only: emit utterances at the pace of a live call")
     parser.add_argument("--json", action="store_true", help="print raw events as JSON lines")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     path = args.path or args.path_opt
     kind = args.source or ("mic" if args.mic else "loopback" if args.loopback else "file" if path else None)
@@ -296,6 +295,18 @@ def main() -> None:
     if kind != "file" and path:
         parser.error("файл звонка указывают только для --source file")
     source = AudioSource(kind=kind, path=path) if kind == "file" else AudioSource(kind=kind)
+    return source, args
+
+
+def main() -> None:
+    """Точка входа: `python -m agent.run <файл> | --mic | --loopback` или форма контракта №7 для UI.
+
+    Контракт №7 (её запускает кнопка «Старт»):
+        python -m agent.run --call-id c001 --source file --path data/calls/001.wav [--phone +7…] [--json]
+    Звук от телефона (ui/server.py пишет его в stdin): --source remote; конец stdin заканчивает
+    звонок штатно — отчёт, save_case, call_ended, код возврата 0.
+    """
+    source, args = parse_args()
     # В читаемом режиме служебные логи (HTTP-запросы к Ollama) только мешают.
     logging.basicConfig(level=logging.INFO if args.json else logging.WARNING,
                         format="%(levelname)s %(name)s: %(message)s")

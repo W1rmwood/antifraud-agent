@@ -100,6 +100,7 @@ class CallState:
     offer_hangup: bool = False  # на этом ходу показать подсказку «закончить разговор»
     rule_quotes: list[str] = field(default_factory=list)  # фразы, на которые уже сработали правила без LLM
     rule_hangup_sent: bool = False  # общая подсказка hangup от правил уже показана
+    last_hangup: str | None = None  # текст последней показанной подсказки hangup
     suggestions: list[str] = field(default_factory=list)  # отправленные подсказки: модели — чтобы не повторялась
 
 
@@ -177,13 +178,18 @@ class CallAgent:
             # Схема ещё не определена, но звонящий уже чего-то требует: безопасный выход
             # показываем сразу, общим текстом. После объявления схемы его заменит текст по её категории.
             call.rule_hangup_sent = True
-            await self._sink.emit(EventType.suggestion, {"text": HANGUP_DEFAULT, "kind": "hangup"})
+            await self._emit_hangup(HANGUP_DEFAULT)
 
     async def analyze(self, batch_size: int = 1) -> Turn:
         """Один ход: граф по окну последних реплик, подсказка hangup и запуск фоновой реплики модели.
 
         `batch_size` — сколько новых реплик пришло с прошлого хода; пишется в Turn.
         """
+        # У разбора приоритет перед подсказкой. Ollama обрабатывает запросы по одному: недописанная
+        # подсказка держала бы очередь, и разбор отставал бы от разговора на её время (на живом
+        # звонке — до 20–25 с на ход). К тому же она отвечает на старое окно — после новых реплик
+        # она устарела.
+        await self._cancel_reply("new batch")
         window = self.state.transcript[-self._deps.settings.window_size :]
         started = time.perf_counter()
         result = await self._graph.ainvoke({"window": window})
@@ -193,9 +199,7 @@ class CallAgent:
             # нужен человеку первым, а реплика придёт через несколько секунд.
             # Текст пишет код: модель не может «забыть» предложить положить трубку.
             self.state.offer_hangup = False
-            await self._sink.emit(
-                EventType.suggestion, {"text": hangup_text(self.state.scheme), "kind": "hangup"}
-            )
+            await self._emit_hangup(hangup_text(self.state.scheme))
         if "analysis" in result and self.state.scheme is not None:
             # Ответку генерируем только при объявленной схеме: это и есть граница
             # «никакой грубости в обычном звонке», зашитая в код, а не в промпт.
@@ -226,13 +230,34 @@ class CallAgent:
         except TimeoutError:
             log.warning("reply for %s cancelled after %.0f s", self.call_id, timeout_s)
 
+    async def _emit_hangup(self, text: str) -> None:
+        """Показывает безопасный выход, если он отличается от уже показанного.
+
+        Тот же текст ещё раз ничего не добавляет: выход и так на экране, а повтор после
+        каждого нового требования выглядел как свежая подсказка — в том числе уже после
+        конца разговора, когда приходил запоздалый разбор.
+        """
+        if text == self.state.last_hangup:
+            return
+        self.state.last_hangup = text
+        await self._sink.emit(EventType.suggestion, {"text": text, "kind": "hangup"})
+
+    async def _cancel_reply(self, reason: str) -> None:
+        """Отменяет недописанную реплику модели. Отмена закрывает запрос — Ollama сразу свободна."""
+        task = self._reply_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        log.info("reply for %s cancelled: %s", self.call_id, reason)
+
     async def finish(self) -> CallCase:
-        """Конец звонка: дожидается реплики модели, затем отчёт, save_case и событие call_ended."""
-        try:
-            await self.wait_reply(self._deps.settings.reply_wait_s)
-        except Exception:
-            # Сбой подсказки не должен помешать сохранить кейс.
-            log.exception("reply failed for %s", self.call_id)
+        """Конец звонка: отчёт, save_case и событие call_ended.
+
+        Недописанную подсказку не ждём, а отменяем: разговор окончен, подсказка уже не нужна,
+        а ожидание задерживало отчёт так, что «Стоп» мог не успеть сохранить кейс.
+        """
+        await self._cancel_reply("call ended")
         summary = await self._summarize()
         case = CallCase(
             call_id=self.call_id,
@@ -367,7 +392,8 @@ class CallAgent:
                 # и разбор вместе с ними. Следующий ход даст новую попытку.
                 log.info("reply for %s skipped: previous one is still generating", self.call_id)
                 return
-            previous_task.result()  # поднимает ошибку прошлой генерации, если она упала не на LLM
+            if not previous_task.cancelled():
+                previous_task.result()  # поднимает ошибку прошлой генерации, если она упала не на LLM
         call, settings = self.state, self._deps.settings
         assert call.scheme is not None
         # Промпт собираем сейчас, по окну и этапу этого хода: пока задача ждёт

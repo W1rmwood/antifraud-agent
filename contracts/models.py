@@ -119,14 +119,18 @@ class Utterance(Contract):
 
 
 class AudioSource(Contract):
-    """Откуда брать звук: файл, микрофон или системный звук (loopback)."""
+    """Откуда брать звук: файл, микрофон, системный звук (loopback) или телефон (remote).
 
-    kind: Literal["file", "mic", "loopback"]
+    remote — сырой PCM s16le 16 кГц моно в stdin агента: его шлёт приложение на iPhone
+    через ui/server.py (docs/ios/architecture.md).
+    """
+
+    kind: Literal["file", "mic", "loopback", "remote"]
     path: str | None = None
 
     @model_validator(mode="after")
     def _file_needs_path(self) -> Self:
-        """Для файла путь обязателен, для микрофона и loopback он не нужен."""
+        """Для файла путь обязателен, для живого звука (mic, loopback, remote) он не нужен."""
         if self.kind == "file" and not self.path:
             raise ValueError("audio source of kind 'file' requires a path")
         return self

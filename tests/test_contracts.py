@@ -132,6 +132,13 @@ class TestAudioSource:
     def test_mic_without_path(self) -> None:
         assert AudioSource(kind="mic").path is None
 
+    def test_remote_phone_without_path(self) -> None:
+        """Звук от телефона приходит в stdin агента — пути нет."""
+        assert AudioSource(kind="remote").path is None
+        assert CallRequest(call_id="c1", source=AudioSource(kind="remote")).source.kind == "remote"
+        with pytest.raises(ValidationError):
+            AudioSource(kind="telepathy")  # type: ignore[arg-type]
+
 
 class TestAgentEvent:
     def test_json_round_trip(self) -> None:

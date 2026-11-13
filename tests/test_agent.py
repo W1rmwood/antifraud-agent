@@ -294,5 +294,7 @@ async def test_demand_without_known_scheme_is_marked_as_generic_fraud(tmp_path: 
     assert detected[0]["scheme_name"] == "Мошенничество (схема не определена)"
     assert detected[0]["confidence"] == harness.settings.detect_threshold  # своей уверенности у модели нет
     assert [s["n"] for s in detected[0]["stages"]] == [1, 2, 3]
-    assert any(e.type == EventType.suggestion and e.payload["kind"] == "hangup" for e in events)
+    # The rules and the generic label give the same way-out text («other» category): shown once, not twice.
+    hangups = [e.payload["text"] for e in events if e.type == EventType.suggestion and e.payload["kind"] == "hangup"]
+    assert len(hangups) == 1
     assert case.scheme_id == "unknown-fraud" and case.max_stage == 3

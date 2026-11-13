@@ -19,8 +19,10 @@ cd ../.. && .venv/bin/python -m ui.server      # http://127.0.0.1:8642
 | Адрес | Что делает |
 |---|---|
 | `GET /api/sources` | тестовые звонки (`list_test_calls`) и записи для проигрывания; идёт ли звонок |
-| `POST /api/calls` | старт: `{source: file\|mic\|loopback\|replay, path?, phone?, realtime?, speed?}`; второй звонок — 409 |
-| `POST /api/calls/<id>/stop` | «Закончить» (в фоне, до 45 с) |
+| `GET /api/info` | `{"app": "antifraud", "api": 1, "auth": true}` — проверка, что это наш сервер; без кода доступа |
+| `POST /api/calls` | старт: `{source: file\|mic\|loopback\|remote\|replay, path?, phone?, realtime?, speed?}`; второй звонок — 409 |
+| `POST /api/calls/<id>/audio?seq=N` | звук от телефона (`remote`): PCM s16le 16 кГц моно, до 1 МБ → 204; повтор `seq` — 204 без записи |
+| `POST /api/calls/<id>/stop` | «Закончить» (в фоне, до 45 с); для `remote` сначала закрывает stdin агента |
 | `GET /api/calls/<id>/events` | поток событий; для упавшего звонка — причина из `<id>.stderr.log` |
 | `POST /api/upload?name=` | запись звонка из браузера → `data/uploads/` (wav, flac, ogg, mp3, txt) |
 | `GET /api/runs` | звонки этого компьютера из `data/runs/` — левая панель и история |
@@ -33,7 +35,23 @@ cd ../.. && .venv/bin/python -m ui.server      # http://127.0.0.1:8642
 «что сказать», этапы, признаки, действия агента с таймингами), отчёт, история с поиском по номеру, схемы.
 Если агент упал, экран называет причину по stderr и даёт команду, которая её исправит.
 
-Тесты моста: `.venv/bin/python -m pytest tests/test_ui_server.py` (без модели — звонки идут проигрыванием).
+Тесты моста: `.venv/bin/python -m pytest tests/test_ui_server.py tests/test_ui_server_phone.py`
+(без модели — звонки идут проигрыванием или подставным агентом).
+
+### Телефон (`source: "remote"`)
+
+Контракт — `docs/ios/architecture.md`, раздел «API для телефона». Коротко:
+
+- `ui.server --host 0.0.0.0` слушает локальную сеть и печатает адрес и код доступа; на macOS объявляет
+  себя через Bonjour (`dns-sd`, `_antifraud._tcp`).
+- Запросы не с `127.0.0.1` / `::1` ко всему, кроме `GET /api/info` (и к статике фронта), — только с
+  `Authorization: Bearer <код>`, иначе 401 `{"error": …}`. Код — `ANTIFRAUD_TOKEN` или 6 случайных цифр.
+- `/audio`: `seq` с 0 по возрастанию, пропуски допустимы, `seq` не больше принятого — повтор (204, звук не
+  пишется). 404 — звонка нет; 409 — звонок не `remote` или уже закончился (в том числе после «Стоп»);
+  400 — нет `seq`, пустое тело или нечётное число байт; 413 — больше 1 МБ.
+- Звук пишется в stdin `agent.run --source remote`; конец stdin — штатный конец звонка (отчёт, кейс,
+  `call_ended`, код 0). 90 с без звука (`SILENCE_TIMEOUT_S`) — сервер сам заканчивает звонок, как по «Стоп».
+- Проверка без телефона: `.venv/bin/python -m audio.send_remote <файл> --server http://127.0.0.1:8642`.
 
 Ниже — исходное описание фасада для Streamlit; всё в нём по-прежнему верно, веб-мост пользуется тем же `ui_api`.
 
@@ -123,11 +141,12 @@ live()
 
 | Функция / класс | Для чего |
 |---|---|
-| `start_call(source="file"\|"mic"\|"loopback", path=None, phone=None, call_id=None, realtime=True) -> CallProcess` | «Старт». Для файла `realtime=True` выдаёт реплики в темпе живого звонка |
+| `start_call(source="file"\|"mic"\|"loopback"\|"remote", path=None, phone=None, call_id=None, realtime=True) -> CallProcess` | «Старт». Для файла `realtime=True` выдаёт реплики в темпе живого звонка; `remote` — процесс со stdin для звука |
 | `start_replay(events_file, call_id=None, speed=1.0) -> CallProcess` | проиграть записанный звонок (`speed=2` — вдвое быстрее) |
 | `CallProcess.call_id`, `.events_path` | где лежит лог этого звонка |
 | `CallProcess.running`, `.returncode` | идёт ли ещё; `0` — закончился штатно, другое — упал |
-| `CallProcess.stop(timeout_s=45)` | «Стоп»: штатное завершение (SIGTERM), не успел — kill |
+| `CallProcess.stop(timeout_s=45)` | «Стоп»: штатное завершение (SIGTERM; у `remote` — сначала конец stdin), не успел — kill |
+| `CallProcess.feed(data)`, `.close_audio()` | `remote`: звук PCM s16le в stdin агента (из любого потока; звонок закончился — `RuntimeError`) и конец звука |
 | `CallProcess.error_text()` | последние строки ошибки, если процесс упал |
 | `EventTail(path).read_new() -> list[AgentEvent]` | дочитать новые события; `.events` — все, `.finished` — пришёл `call_ended` |
 | `read_events(path)` | прочитать готовый лог целиком |
@@ -207,6 +226,8 @@ live()
 
 `--source mic` и `--source loopback` — живой звук (`--path` не нужен). SIGTERM или Ctrl+C — штатное
 завершение: дорабатывает разбор, пишет `summary` и `call_ended`. Папку логов задаёт `ANTIFRAUD_RUNS_DIR`.
+`--source remote` — звук PCM s16le 16 кГц моно из stdin (его пишет `ui/server.py`); конец stdin заканчивает
+звонок так же штатно, код возврата 0.
 
 ## Подводные камни
 

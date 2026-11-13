@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import AsyncIterator, Callable
 
 from audio import asr
-from audio.capture import SAMPLE_RATE, load_channels, open_capture
+from audio.capture import SAMPLE_RATE, load_channels, open_capture, open_remote
 from audio.vad import StreamSegmenter, split_speech
 from contracts.models import AudioSource, Speaker, Utterance
 
@@ -35,10 +35,13 @@ async def listen(source: AudioSource, call_id: str, *, realtime: bool = False,
     realtime=True — реплика выдаётся не раньше, чем фраза «прозвучала» бы в живом звонке
     (для демо и замера задержки); по умолчанию файл обрабатывается так быстро, как получится.
     kind="mic"/"loopback": живой звук, один канал → speaker = unknown (см. _listen_live);
-    blocks — подменяемый источник блоков (в тестах вместо микрофона).
+    kind="remote": то же, но звук — PCM s16le из stdin (его присылает телефон через ui/server.py);
+    конец stdin — конец звонка, недосказанная фраза дораспознаётся.
+    blocks — подменяемый источник блоков (в тестах вместо микрофона и stdin).
     """
-    if source.kind in ("mic", "loopback"):
-        async for u in _listen_live(source, call_id, model_size, blocks or open_capture):
+    if source.kind in ("mic", "loopback", "remote"):
+        default = open_remote if source.kind == "remote" else open_capture
+        async for u in _listen_live(source, call_id, model_size, blocks or default):
             yield u
         return
     if not source.path:
